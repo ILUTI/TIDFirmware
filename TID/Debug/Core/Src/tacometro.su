@@ -1,0 +1,8 @@
+../Core/Src/tacometro.c:29:6:Tacometro_Init	16	static
+../Core/Src/tacometro.c:46:6:Tacometro_CaptureCallback	40	static
+../Core/Src/tacometro.c:101:6:Tacometro_Update	24	static,ignoring_inline_asm
+../Core/Src/tacometro.c:139:7:Tacometro_GetRPMInstantanea	4	static
+../Core/Src/tacometro.c:144:7:Tacometro_GetRPMFiltrada	4	static
+../Core/Src/tacometro.c:149:7:Tacometro_GetFrecuenciaHz	4	static
+../Core/Src/tacometro.c:154:6:Tacometro_EstaDetenido	4	static
+../Core/Src/tacometro.c:159:10:Tacometro_GetContadorRuidoFiltrado	4	static

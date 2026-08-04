@@ -1,0 +1,8 @@
+../Core/Src/tacometro.c:29:6:Tacometro_Init	1
+../Core/Src/tacometro.c:46:6:Tacometro_CaptureCallback	11
+../Core/Src/tacometro.c:101:6:Tacometro_Update	4
+../Core/Src/tacometro.c:139:7:Tacometro_GetRPMInstantanea	1
+../Core/Src/tacometro.c:144:7:Tacometro_GetRPMFiltrada	1
+../Core/Src/tacometro.c:149:7:Tacometro_GetFrecuenciaHz	1
+../Core/Src/tacometro.c:154:6:Tacometro_EstaDetenido	1
+../Core/Src/tacometro.c:159:10:Tacometro_GetContadorRuidoFiltrado	1
