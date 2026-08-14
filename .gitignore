@@ -1,0 +1,47 @@
+# ============================================================================
+# .gitignore -- Proyecto TID (STM32CubeIDE, STM32G431KBT6U)
+# ============================================================================
+
+# --- Carpetas de build (se regeneran al compilar, no versionar) ---
+Debug/
+Release/
+build/
+
+# --- Archivos objeto y de dependencias generados por el compilador ---
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.su
+
+# --- Configuración local del IDE (especifica de cada maquina/usuario) ---
+.settings/
+.metadata/
+
+# --- Archivos temporales del sistema operativo ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Backups de editores de texto ---
+*~
+*.bak
+*.swp
+
+# --- Logs de depuracion / diagnostico temporales ---
+*.log
+
+# ============================================================================
+# NOTA: SI se deben subir (no ignorar):
+#   - Core/Src/*.c, Core/Inc/*.h        (todo el codigo fuente)
+#   - *.ioc                             (configuracion de CubeMX)
+#   - .project, .cproject               (para importar el proyecto directo
+#                                         en STM32CubeIDE sin reconfigurar)
+#   - README.md
+#   - Drivers/ (si se modificaron archivos HAL a mano; si son los
+#     generados por CubeMX sin cambios, es opcional versionarlos --
+#     se regeneran solos al abrir el .ioc y generar codigo de nuevo)
+# ============================================================================
