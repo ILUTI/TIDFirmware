@@ -208,6 +208,29 @@ uint16_t CalibFlash_GetHisteresisModoS(void);
 float    CalibFlash_GetPresionObjetivo(void);
 float    CalibFlash_GetTasaMaxCambioRpmLlenadoS(void);
 
+/** Ultima hora UTC (epoch unix) confirmada por la red, persistida en
+ * flash -- 0 si nunca se sincronizo todavia. Se usa como mejor
+ * estimacion inicial del RTC en el arranque (ver
+ * Reloj_CargarHoraAproximada() en rtc_reloj.h), mientras se espera la
+ * resincronizacion real via DeviceTimeReq. Distinto de SET_RPM/PRESION:
+ * este campo SI se persiste (no llega por downlink de parametro, lo
+ * escribe main.c directo tras cada sincronizacion exitosa). */
+uint32_t CalibFlash_GetUltimaHoraUtcConocida(void);
+bool     CalibFlash_SetUltimaHoraUtcConocida(uint32_t epochUtc);
+
+/** Última posición GPS válida conocida, persistida en flash -- 0.0f en
+ * ambos campos si nunca hubo fix todavía. Mismo criterio que
+ * CalibFlash_GetUltimaHoraUtcConocida(): se usa como respaldo cuando
+ * el GPS no tiene fix en el momento de armar el uplink (ver gps.h
+ * GPS_TieneFix()), en vez de caer directo a la coordenada fija
+ * hardcodeada en main.c. Se persiste una sola vez por arranque, la
+ * primera vez que el GPS consigue fix (no en cada actualización cada
+ * 10s -- desgastaría la flash sin necesidad, ya que para este nodo
+ * fijo la posición prácticamente no cambia). */
+float CalibFlash_GetUltimaLatitudConocida(void);
+float CalibFlash_GetUltimaLongitudConocida(void);
+bool  CalibFlash_SetUltimaPosicionConocida(float latitud, float longitud);
+
 /* ==================== SETTERS INDIVIDUALES (validan + persisten) ==================== */
 /* Se exponen también individualmente por si se necesitan llamar
  * directo (ej. desde una futura pantalla local, o pruebas), aunque el

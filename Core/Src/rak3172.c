@@ -52,6 +52,11 @@ static char     s_ultimaRespuesta[RAK3172_RX_BUFFER_SIZE];
 static bool     s_hayRespuestaNueva = false;
 static volatile bool s_estaUnido = false;
 
+/* true una vez que la red confirmó el envío de la hora (DeviceTimeReq)
+ * -- ver "+EVT:TIMEREQ" en RAK3172_ProcesarLinea() y
+ * RAK3172_SolicitarHoraRed()/RAK3172_ConsultarHoraRed(). */
+static volatile bool s_horaDeRedDisponible = false;
+
 /* Reintento de Application ACK: si al momento de querer mandarlo el
  * canal AT está ocupado (otro comando en curso), se guarda aquí y
  * RAK3172_Update() lo reintenta en cuanto el canal se libere, hasta
@@ -90,6 +95,7 @@ void RAK3172_Init(UART_HandleTypeDef *huart)
     s_ultimoResultado = RAK3172_OK;
     s_hayRespuestaNueva = false;
     memset(s_ultimaRespuesta, 0, sizeof(s_ultimaRespuesta));
+    s_horaDeRedDisponible = false;
 
     /* Antes de arrancar la recepción, limpiar cualquier flag de error
      * (Overrun/Framing/Noise) y vaciar el registro de datos. Esto es
@@ -248,14 +254,14 @@ bool RAK3172_EstaUnido(void)
 bool RAK3172_Join(void)
 {
     s_estaUnido = false;
-    /* Formato recomendado por RAK (ver AT Command Migration Guide):
-     * join=1, auto-join=1 (el propio módulo reintenta unirse solo,
-     * de forma persistente -- RUI3 guarda esta configuración en
-     * memoria permanente, así que incluso ante un reset/pérdida de
-     * energía el RAK3172 puede seguir intentando sin depender de que
-     * el G431 vuelva a mandar este comando), intervalo de
-     * reintento=10s, máximo 8 intentos. */
-    return RAK3172_EnviarComandoAT("AT+JOIN=1:1:10:8");
+    /* ⚠️ PRUEBA TEMPORAL: AutoJoin=0 en vez de 1, para aislar si ese
+     * parametro especifico causa el AT_ERROR visto en campo (ver
+     * README/notas de sesion). El formato "1:0:10:8" es el que
+     * confirma la documentacion oficial de RAK que responde OK.
+     * Si esto funciona, evaluar si hace falta AutoJoin=1 en produccion
+     * (reintento automatico del propio modulo) o si conviene manejar
+     * los reintentos desde el host en su lugar. */
+    return RAK3172_EnviarComandoAT("AT+JOIN=1:0:10:8");
 }
 
 static bool RAK3172_EnviarAckInterno(uint8_t id, uint8_t status, uint16_t valorRaw)
@@ -297,8 +303,8 @@ bool RAK3172_EnviarRPM(float rpm)
 {
     /* Codificación simple: RPM x10 como entero de 16 bits sin signo,
      * en hexadecimal de 4 dígitos. Ej: 2783.2 RPM -> 27832 -> "6CB8".
-     * Ajustar si se define un formato de payload distinto del lado
-     * del servidor/decoder de la aplicación LoRaWAN. */
+     * ⚠️ SUPERADO por RAK3172_EnviarUplinkLive() -- se mantiene solo
+     * por compatibilidad/pruebas de banco, main.c ya no lo llama. */
     if (rpm < 0.0f) {
         rpm = 0.0f;
     }
@@ -313,6 +319,96 @@ bool RAK3172_EnviarRPM(float rpm)
               (unsigned int)RAK3172_FPORT_UPLINK_RPM, valorEscalado);
 
     return RAK3172_EnviarComandoAT(comando);
+}
+
+bool RAK3172_EnviarUplinkLive(uint16_t motorIdNumeric, float rpm, float presion,
+                               uint8_t estado, uint32_t fechaHoraLocal,
+                               uint32_t inicioOperacionLocal,
+                               uint32_t segundosTranscurridos,
+                               float latitud, float longitud)
+{
+    if (rpm < 0.0f) { rpm = 0.0f; }
+    if (rpm > 6553.5f) { rpm = 6553.5f; }
+    if (presion < 0.0f) { presion = 0.0f; }
+    if (presion > 6553.5f) { presion = 6553.5f; }
+
+    uint16_t rpmRaw = (uint16_t)(rpm * 10.0f + 0.5f);
+    uint16_t presionRaw = (uint16_t)(presion * 10.0f + 0.5f);
+    int32_t latRaw = (int32_t)(latitud * 10000000.0f);
+    int32_t lonRaw = (int32_t)(longitud * 10000000.0f);
+
+    /* Layout de 27 bytes -- DEBE coincidir byte a byte con
+     * decoder.py::_decodificar_live() del lado AWS. Cualquier cambio
+     * acá tiene que reflejarse allá, y viceversa:
+     *   0-1   motorIdNumeric   uint16 BE
+     *   2-3   rpm              uint16 BE, x10
+     *   4-5   presion          uint16 BE, x10
+     *   6     estado           uint8 (1=ACTIVO,2=APAGADO,3=ENCENDIDO)
+     *   7-10  fechaHoraLocal   uint32 BE (epoch, ya con -6h aplicado)
+     *   11-14 inicioOperacionLocal  uint32 BE
+     *   15-18 segundosTranscurridos uint32 BE
+     *   19-22 latitud          int32 BE, x10,000,000
+     *   23-26 longitud         int32 BE, x10,000,000
+     */
+    uint8_t payload[27];
+    payload[0]  = (uint8_t)((motorIdNumeric >> 8) & 0xFFU);
+    payload[1]  = (uint8_t)(motorIdNumeric & 0xFFU);
+    payload[2]  = (uint8_t)((rpmRaw >> 8) & 0xFFU);
+    payload[3]  = (uint8_t)(rpmRaw & 0xFFU);
+    payload[4]  = (uint8_t)((presionRaw >> 8) & 0xFFU);
+    payload[5]  = (uint8_t)(presionRaw & 0xFFU);
+    payload[6]  = estado;
+    payload[7]  = (uint8_t)((fechaHoraLocal >> 24) & 0xFFU);
+    payload[8]  = (uint8_t)((fechaHoraLocal >> 16) & 0xFFU);
+    payload[9]  = (uint8_t)((fechaHoraLocal >> 8) & 0xFFU);
+    payload[10] = (uint8_t)(fechaHoraLocal & 0xFFU);
+    payload[11] = (uint8_t)((inicioOperacionLocal >> 24) & 0xFFU);
+    payload[12] = (uint8_t)((inicioOperacionLocal >> 16) & 0xFFU);
+    payload[13] = (uint8_t)((inicioOperacionLocal >> 8) & 0xFFU);
+    payload[14] = (uint8_t)(inicioOperacionLocal & 0xFFU);
+    payload[15] = (uint8_t)((segundosTranscurridos >> 24) & 0xFFU);
+    payload[16] = (uint8_t)((segundosTranscurridos >> 16) & 0xFFU);
+    payload[17] = (uint8_t)((segundosTranscurridos >> 8) & 0xFFU);
+    payload[18] = (uint8_t)(segundosTranscurridos & 0xFFU);
+    payload[19] = (uint8_t)(((uint32_t)latRaw >> 24) & 0xFFU);
+    payload[20] = (uint8_t)(((uint32_t)latRaw >> 16) & 0xFFU);
+    payload[21] = (uint8_t)(((uint32_t)latRaw >> 8) & 0xFFU);
+    payload[22] = (uint8_t)((uint32_t)latRaw & 0xFFU);
+    payload[23] = (uint8_t)(((uint32_t)lonRaw >> 24) & 0xFFU);
+    payload[24] = (uint8_t)(((uint32_t)lonRaw >> 16) & 0xFFU);
+    payload[25] = (uint8_t)(((uint32_t)lonRaw >> 8) & 0xFFU);
+    payload[26] = (uint8_t)((uint32_t)lonRaw & 0xFFU);
+
+    char payloadHex[27 * 2 + 1];
+    for (uint8_t i = 0; i < 27U; i++) {
+        snprintf(&payloadHex[i * 2], 3, "%02X", payload[i]);
+    }
+
+    char comando[RAK3172_TX_BUFFER_SIZE];
+    snprintf(comando, sizeof(comando), "AT+SEND=%u:%s",
+              (unsigned int)RAK3172_FPORT_UPLINK_RPM, payloadHex);
+
+    return RAK3172_EnviarComandoAT(comando);
+}
+
+bool RAK3172_SolicitarHoraRed(void)
+{
+    return RAK3172_EnviarComandoAT("AT+TIMEREQ=1");
+}
+
+bool RAK3172_HoraDeRedDisponible(void)
+{
+    return s_horaDeRedDisponible;
+}
+
+bool RAK3172_ConsultarHoraRed(void)
+{
+    /* ⚠️ PENDIENTE DE VERIFICAR EN CAMPO: no hay un ejemplo publicado
+     * del formato EXACTO de la respuesta a "AT+LTIME=?" (si es un
+     * entero decimal simple del epoch UTC, o trae texto/campos
+     * adicionales). El parseo en main.c asume un entero decimal plano
+     * -- si el monitor serie muestra otra cosa, ajustar el sscanf allá. */
+    return RAK3172_EnviarComandoAT("AT+LTIME=?");
 }
 
 /* ==================== FUNCIONES PRIVADAS ==================== */
@@ -333,8 +429,37 @@ static void RAK3172_EncolarLinea(const char *linea, uint16_t len)
 
 static void RAK3172_ProcesarLinea(const char *linea)
 {
+    /* Solo se imprimen los eventos "+EVT:" (join, TX_DONE, downlinks
+     * recibidos, etc.) -- no el ruido de "OK"/eco de cada comando AT
+     * enviado, que ya se reporta aparte via RAK3172_GetUltimoResultado(). */
+    if (strncmp(linea, "+EVT:", 5) == 0) {
+        printf("RAK3172 RX crudo: '%s'\r\n", linea);
+    }
+
     if (strcmp(linea, "+EVT:JOINED") == 0) {
         s_estaUnido = true;
+        return;
+    }
+
+    if (strcmp(linea, "+EVT:TIMEREQ_OK") == 0) {
+        /* Confirmación de que el uplink que se acaba de mandar trajo
+         * la hora de la red de vuelta (DeviceTimeReq) -- ya se puede
+         * consultar el valor con AT+LTIME=? (ver RAK3172_ConsultarHoraRed()).
+         * ⚠️ Nombre real confirmado en campo (2026-08-14): es
+         * "+EVT:TIMEREQ_OK", NO "+EVT:TIMEREQ" como se había asumido
+         * sin un ejemplo publicado -- con el nombre viejo este bloque
+         * nunca se ejecutaba y el reloj quedaba pegado en su valor
+         * por defecto para siempre. */
+        s_horaDeRedDisponible = true;
+        printf("RAK3172: hora de red disponible (+EVT:TIMEREQ_OK) -- listo para AT+LTIME=?\r\n");
+        return;
+    }
+
+    if (strcmp(linea, "+EVT:TIMEREQ") == 0) {
+        /* Se mantiene por si alguna version de RUI3 usa este nombre
+         * sin el sufijo _OK -- mismo efecto. */
+        s_horaDeRedDisponible = true;
+        printf("RAK3172: hora de red disponible (+EVT:TIMEREQ) -- listo para AT+LTIME=?\r\n");
         return;
     }
 
@@ -347,11 +472,19 @@ static void RAK3172_ProcesarLinea(const char *linea)
         if (strcmp(linea, "OK") == 0) {
             s_comandoEnCurso = false;
             s_ultimoResultado = RAK3172_OK;
-        } else if (strncmp(linea, "ERROR", 5) == 0) {
+        } else if (strncmp(linea, "ERROR", 5) == 0 || strncmp(linea, "AT_ERROR", 8) == 0
+                   || strstr(linea, "_ERROR") != NULL) {
+            /* RUI3 puede responder "ERROR" a secas, o variantes con
+             * prefijo/sufijo como "AT_ERROR", "AT_PARAM_ERROR", etc.
+             * -- sin este chequeo mas amplio, esas respuestas caian en
+             * la rama de "linea de datos" de abajo y el comando se
+             * quedaba colgado hasta expirar por timeout, en vez de
+             * detectarse al instante como error. */
             s_comandoEnCurso = false;
             s_ultimoResultado = RAK3172_ERROR;
         } else if (linea[0] != '\0') {
-            /* Línea de datos previa al OK, ej. respuesta de AT+VER=? */
+            /* Línea de datos previa al OK, ej. respuesta de AT+VER=? o
+             * de AT+LTIME=? */
             strncpy(s_ultimaRespuesta, linea, sizeof(s_ultimaRespuesta) - 1);
             s_ultimaRespuesta[sizeof(s_ultimaRespuesta) - 1] = '\0';
             s_hayRespuestaNueva = true;

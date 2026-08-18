@@ -28,19 +28,11 @@
 
 #define CALIB_FLASH_PAGE_NUMBER   63U
 #define CALIB_FLASH_ADDRESS       0x0801F800UL
-#define CALIB_FLASH_MAGIC         0x43414C43UL  /* "CALC" -- se cambió de
-                                                   * 0x43414C42 ("CALB") a
-                                                   * propósito: la estructura
-                                                   * creció (se agregaron
-                                                   * servo/PID/etc.) después
-                                                   * de que ya existían datos
-                                                   * guardados con el esquema
-                                                   * viejo más chico. Sin este
-                                                   * cambio, CalibFlash_Init()
-                                                   * copiaría bytes de flash
-                                                   * borrada (0xFF) hacia los
-                                                   * campos nuevos, dando
-                                                   * valores basura (65535). */
+#define CALIB_FLASH_MAGIC         0x43414C45UL  /* "CALE" -- subido desde
+                                                   * "CALD" porque se agregaron
+                                                   * ultimaLatitudConocida/
+                                                   * ultimaLongitudConocida
+                                                   * a CalibFlash_Datos_t. */
 
 /* ==================== VALORES POR DEFECTO ==================== */
 /* Los mismos que ya tenías validados en campo para SET_RATIO/ALPHA;
@@ -93,8 +85,11 @@ typedef struct {
     float    tasaMaxCambioRpmS;        /* TASA_MAX_CAMBIO_RPM_S */
     float    presionObjetivo;          /* PRESION_OBJETIVO */
     float    tasaMaxCambioRpmLlenadoS; /* TASA_MAX_CAMBIO_RPM_LLENADO_S */
+    float    ultimaLatitudConocida;    /* GPS, 0.0f = nunca hubo fix */
+    float    ultimaLongitudConocida;   /* GPS, 0.0f = nunca hubo fix */
 
     uint32_t timeoutSinComandoS;       /* TIMEOUT_SIN_COMANDO_S */
+    uint32_t ultimaHoraUtcConocida;    /* epoch UTC, 0 = nunca sincronizado */
 
     uint16_t servoPulsoMinUs;          /* SERVO_PULSO_MIN */
     uint16_t servoPulsoMaxUs;          /* SERVO_PULSO_MAX */
@@ -105,7 +100,8 @@ typedef struct {
     uint8_t  controlHabilitado;        /* CONTROL_HABILITADO (0/1) */
     uint8_t  modo;                     /* MODO (0/1/2) */
     uint8_t  nodeId;                   /* NODE_ID */
-    uint8_t  relleno[9];               /* completa a múltiplo de 8 bytes (72 total) */
+    uint8_t  relleno[7];               /* completa a múltiplo de 8 bytes -- ajustar si
+                                         * CalibFlash_VerificarTamano rompe la compilación */
 } CalibFlash_Datos_t;
 
 /* Verificación en tiempo de compilación de que el tamaño es múltiplo
@@ -150,6 +146,9 @@ void CalibFlash_Init(void)
 
     if (datosEnFlash->magic == CALIB_FLASH_MAGIC) {
         memcpy(&s_datos, datosEnFlash, sizeof(CalibFlash_Datos_t));
+        /* ultimaHoraUtcConocida/ultimaLatitudConocida/ultimaLongitudConocida
+         * vienen tal cual estaban en flash -- NO se tocan aca, son
+         * justamente los valores que queremos preservar entre arranques. */
     } else {
         memset(&s_datos, 0, sizeof(s_datos));
         s_datos.magic = CALIB_FLASH_MAGIC;
@@ -164,6 +163,12 @@ void CalibFlash_Init(void)
         s_datos.presionObjetivo          = DEFAULT_PRESION_OBJETIVO;
         s_datos.tasaMaxCambioRpmLlenadoS = DEFAULT_TASA_MAX_CAMBIO_LLENADO_S;
         s_datos.timeoutSinComandoS       = DEFAULT_TIMEOUT_SIN_COMANDO_S;
+        s_datos.ultimaHoraUtcConocida    = 0U;  /* 0 = nunca sincronizado con la red --
+                                                   * SOLO se resetea aca (primera vez /
+                                                   * flash invalida), no en cada arranque. */
+        s_datos.ultimaLatitudConocida    = 0.0f; /* 0.0f = nunca hubo fix GPS -- mismo
+                                                     * criterio que ultimaHoraUtcConocida. */
+        s_datos.ultimaLongitudConocida   = 0.0f;
         s_datos.servoPulsoMinUs          = DEFAULT_SERVO_PULSO_MIN_US;
         s_datos.servoPulsoMaxUs          = DEFAULT_SERVO_PULSO_MAX_US;
         s_datos.intervaloOperativoS      = DEFAULT_INTERVALO_OPERATIVO_S;
@@ -474,6 +479,37 @@ uint8_t  CalibFlash_GetNodeId(void)                   { return s_datos.nodeId; }
 uint16_t CalibFlash_GetHisteresisModoS(void)          { return s_datos.histeresisModoS; }
 float    CalibFlash_GetPresionObjetivo(void)          { return s_datos.presionObjetivo; }
 float    CalibFlash_GetTasaMaxCambioRpmLlenadoS(void) { return s_datos.tasaMaxCambioRpmLlenadoS; }
+
+uint32_t CalibFlash_GetUltimaHoraUtcConocida(void)
+{
+    return s_datos.ultimaHoraUtcConocida;
+}
+
+bool CalibFlash_SetUltimaHoraUtcConocida(uint32_t epochUtc)
+{
+    s_datos.ultimaHoraUtcConocida = epochUtc;
+    return CalibFlash_EscribirEnFlash();
+}
+
+float CalibFlash_GetUltimaLatitudConocida(void)
+{
+    return s_datos.ultimaLatitudConocida;
+}
+
+float CalibFlash_GetUltimaLongitudConocida(void)
+{
+    return s_datos.ultimaLongitudConocida;
+}
+
+bool CalibFlash_SetUltimaPosicionConocida(float latitud, float longitud)
+{
+    /* Un solo borrado/escritura para los dos campos juntos -- se
+     * actualizan siempre a la vez (ver GPS_TieneFix() en main.c), no
+     * tiene sentido separarlos en dos llamadas y gastar flash doble. */
+    s_datos.ultimaLatitudConocida = latitud;
+    s_datos.ultimaLongitudConocida = longitud;
+    return CalibFlash_EscribirEnFlash();
+}
 
 /* ==================== SETTERS (validan rango + persisten) ==================== */
 

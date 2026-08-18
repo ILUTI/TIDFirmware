@@ -8,9 +8,10 @@
  *     valor consultado) de forma no bloqueante, integrada al loop
  *     principal (Tacometro_Update()/Modbus_Update()).
  *   - Recibir y parsear eventos asíncronos "+EVT:" que el módulo manda
- *     por su cuenta (ej. downlink recibido), sin que el host los haya
- *     solicitado.
- *   - Exponer una función simple para mandar la RPM actual como uplink.
+ *     por su cuenta (ej. downlink recibido, hora de red disponible),
+ *     sin que el host los haya solicitado.
+ *   - Exponer funciones para mandar el uplink LIVE del nodo motor y
+ *     para sincronizar la hora contra la red (DeviceTimeReq).
  *
  * Uso típico en main.c:
  *   RAK3172_Init(&hlpuart1);
@@ -18,7 +19,7 @@
  *   while (1) {
  *       RAK3172_Update();
  *       if (debe_mandar_uplink) {
- *           RAK3172_EnviarRPM(Tacometro_GetRPMFiltrada());
+ *           RAK3172_EnviarUplinkLive(...);
  *       }
  *   }
  *
@@ -49,7 +50,10 @@ extern "C" {
  * en main.c). */
 #define RAK3172_RX_BUFFER_SIZE        128U
 
-/* Tamaño máximo de un comando AT a transmitir (incluye "AT+...\r\n"). */
+/* Tamaño máximo de un comando AT a transmitir (incluye "AT+...\r\n").
+ * ⚠️ El uplink LIVE de 27 bytes en hex ocupa 54 caracteres + "AT+SEND=" +
+ * FPort + ":" + "\r\n" (~66-70 bytes) -- 96U alcanza con margen, pero si
+ * se agregan más campos al payload en el futuro, revisar este tamaño. */
 #define RAK3172_TX_BUFFER_SIZE        96U
 
 /* Timeout por defecto esperando respuesta "OK"/"ERROR" a un comando AT
@@ -57,8 +61,9 @@ extern "C" {
  * puede pasar un timeout distinto por comando si se requiere. */
 #define RAK3172_TIMEOUT_DEFAULT_MS    2000U
 
-/* FPort usado para el uplink de RPM (elige un valor y mantenlo
- * consistente con lo que se configure del lado del servidor/decoder). */
+/* FPort usado para el uplink LIVE del motor (RPM + presión + estado +
+ * timestamps + posición, ver RAK3172_EnviarUplinkLive()). Mantenlo
+ * consistente con lo que espera decoder.py del lado AWS. */
 #define RAK3172_FPORT_UPLINK_RPM      1U
 
 /* FPort usado para downlinks de configuración de parámetros.
@@ -158,10 +163,41 @@ bool RAK3172_GetUltimaRespuesta(char *destino, uint32_t tamDestino);
  * sin signo de 16 bits escalado x10 (ej. 2783.2 RPM -> 27832 -> hex
  * "6CB8"), para evitar la complejidad de mandar floats en hex.
  *
+ * ⚠️ SUPERADO por RAK3172_EnviarUplinkLive() -- se mantiene solo por
+ * compatibilidad/pruebas de banco, main.c ya no lo llama.
+ *
  * @param rpm   RPM a enviar (típicamente Tacometro_GetRPMFiltrada()).
  * @return true si se pudo encolar el comando AT+SEND correspondiente.
  */
 bool RAK3172_EnviarRPM(float rpm);
+
+/**
+ * Arma y envía el uplink LIVE extendido (27 bytes) del nodo motor:
+ * motorIdNumeric + RPM + presión + estado + fecha/hora + inicio de
+ * operación + segundos transcurridos + lat/lon. Ver decoder.py del
+ * lado AWS (_decodificar_live()) para el layout exacto de offsets --
+ * cualquier cambio acá debe reflejarse allá.
+ *
+ * @param motorIdNumeric           Numérico del nodo (ej. 1 -> "DSL-0001").
+ * @param rpm                      RPM actual.
+ * @param presion                  Presión de salida del motor (0.0f
+ *                                 mientras no exista presion.c).
+ * @param estado                   1=ACTIVO, 2=APAGADO, 3=ENCENDIDO (ver
+ *                                 ESTADO_* en main.c).
+ * @param fechaHoraLocal           Epoch unix, YA con el offset de
+ *                                 Guatemala aplicado (Reloj_GetUnixTimeLocal()).
+ * @param inicioOperacionLocal     Epoch unix local de cuándo empezó el
+ *                                 estado actual.
+ * @param segundosTranscurridos    Segundos desde inicioOperacionLocal.
+ * @param latitud                  Latitud fija del sitio (sin GPS aún).
+ * @param longitud                 Longitud fija del sitio (sin GPS aún).
+ * @return true si se pudo encolar el comando AT+SEND correspondiente.
+ */
+bool RAK3172_EnviarUplinkLive(uint16_t motorIdNumeric, float rpm, float presion,
+                               uint8_t estado, uint32_t fechaHoraLocal,
+                               uint32_t inicioOperacionLocal,
+                               uint32_t segundosTranscurridos,
+                               float latitud, float longitud);
 
 /**
  * Arma y envía el Application ACK del protocolo Quick-Set (4 bytes:
@@ -185,6 +221,34 @@ bool RAK3172_EnviarRPM(float rpm);
  *         encolado para reintento (no es necesariamente un error).
  */
 bool RAK3172_EnviarAck(uint8_t id, uint8_t status, uint16_t valorRaw);
+
+/**
+ * Pide la hora UTC a la red LoRaWAN (DeviceTimeReq de la especificación
+ * LoRaWAN, vía "AT+TIMEREQ=1" en RUI3). El valor llega "montado" en el
+ * próximo uplink exitoso -- no es instantáneo. Llamar una vez, después
+ * de que RAK3172_EstaUnido() sea true. Ver RAK3172_HoraDeRedDisponible().
+ *
+ * @return true si se pudo encolar el comando AT+TIMEREQ=1.
+ */
+bool RAK3172_SolicitarHoraRed(void);
+
+/**
+ * true una vez que la red confirmó el envío de la hora (evento
+ * "+EVT:TIMEREQ" visto tras un uplink) -- en ese punto ya se puede
+ * llamar RAK3172_ConsultarHoraRed() para leer el valor.
+ */
+bool RAK3172_HoraDeRedDisponible(void);
+
+/**
+ * Consulta el valor de hora ya recibido de la red ("AT+LTIME=?"). La
+ * respuesta llega por el mecanismo genérico RAK3172_GetUltimaRespuesta()
+ * -- leer ese buffer después de que este comando termine
+ * (RAK3172_ComandoListo() vuelva a true) y parsear el epoch (ver nota
+ * en rak3172.c sobre el formato de respuesta aún sin confirmar en campo).
+ *
+ * @return true si se pudo encolar el comando AT+LTIME=?.
+ */
+bool RAK3172_ConsultarHoraRed(void);
 
 #ifdef __cplusplus
 }
