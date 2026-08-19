@@ -276,7 +276,12 @@ Formato de `+CGPSINFO:` (sin checksum, a diferencia de NMEA):
 Sin fix, todos los campos vienen vacíos: `+CGPSINFO: ,,,,,,,,`.
 
 **Secuencia de inicio** (`main.c`): `GPS_Init(&huart2)` arranca la
-recepción, luego `AT+CGPS=1` (enciende el motor GNSS) y
+recepción, luego `AT+CGPS=1` (enciende el motor GNSS; responde `ERROR`
+—inofensivo— si el módulo ya estaba encendido de una sesión previa),
+una pausa de **1.5s** (⚠️ necesaria, confirmada en campo: sin ella, tras
+el `ERROR` el módulo dejaba de contestar absolutamente nada, ni
+siquiera el eco del siguiente comando — parece necesitar ese instante
+para estabilizarse tras esa respuesta), y por último
 `AT+CGPSINFO=10` (habilita el auto-reporte cada 10s).
 
 **Prioridad de posición para el uplink LIVE** (`main.c`): GPS con fix

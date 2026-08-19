@@ -160,8 +160,17 @@ int main(void)
   HAL_Delay(500);  // dar tiempo al SIM7600X a terminar su propio arranque
 
   /* Enciende el motor GNSS. Confirmado en campo (2026-08-18) via
-   * USB-TTL directo al modulo: contesta "OK". */
+   * USB-TTL directo al modulo: contesta "OK" (o "ERROR" si ya estaba
+   * encendido de una sesion anterior -- inofensivo, ver nota de abajo). */
   GPS_EnviarComandoAT("AT+CGPS=1");
+
+  /* Pausa necesaria entre comandos -- confirmada en campo (2026-08-18):
+   * sin esta espera, tras un "ERROR" a AT+CGPS=1 (GPS ya encendido de
+   * una sesion previa) el modulo dejaba de contestar CUALQUIER cosa,
+   * ni siquiera el eco de AT+CGPSINFO=10 mandado justo despues -- el
+   * modulo necesita este instante para terminar de procesar/
+   * estabilizarse antes de aceptar el siguiente comando. */
+  HAL_Delay(1500);
 
   /* Habilita el auto-reporte periodico de posicion cada 10 segundos --
    * a partir de aca el modulo manda "+CGPSINFO: ..." por su cuenta
