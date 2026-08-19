@@ -20,7 +20,7 @@
  *   Servo_Init(&htim3, TIM_CHANNEL_3);
  *   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
  *   ...
- *   Servo_SetPulsoUs(1500);   // punto medio, prueba en banco
+ *   Servo_SetPulsoUs(CalibFlash_GetServoPulsoMinUs());  // posición segura (sin aceleración) al arrancar
  *
  * IMPORTANTE (prueba en banco antes de conectar a la varilla real):
  *   Antes de conectar el servo a la varilla del acelerador, pruébalo
@@ -38,6 +38,15 @@ extern "C" {
 
 #include "stm32g4xx_hal.h"
 #include <stdint.h>
+
+/* Velocidad máxima de movimiento del servo, en µs de pulso por segundo.
+ * Protección mecánica: limita qué tan rápido puede saltar el pulso
+ * aplicado de un ciclo a otro (evita choques en la varilla del
+ * acelerador ante una corrección brusca del PID). Distinto de
+ * TASA_MAX_CAMBIO_RPM_S (esa limita el setpoint de RPM, no el pulso
+ * físico del servo). 1250 µs/s == el barrido de la prueba de banco
+ * original (25µs cada 20ms). */
+#define SERVO_VELOCIDAD_MAX_US_S    1250U
 
 /* ==================== API PÚBLICA ==================== */
 
@@ -62,6 +71,29 @@ void Servo_Init(TIM_HandleTypeDef *htim, uint32_t canal);
  *         que el llamador sepa si su solicitud se ajustó.
  */
 uint16_t Servo_SetPulsoUs(uint16_t microsegundos);
+
+/**
+ * Mueve el servo gradualmente hacia el ancho de pulso indicado, sin
+ * bloquear -- pensada para llamarse en cada vuelta del loop principal
+ * (cadencia irregular; el paso se calcula por tiempo transcurrido
+ * real vía HAL_GetTick(), no por conteo de llamadas). Cada llamada
+ * avanza como máximo lo que permite SERVO_VELOCIDAD_MAX_US_S desde la
+ * llamada anterior; si el destino ya se alcanzó, no hace nada más que
+ * mantenerlo.
+ *
+ * Pensada para ser el único camino de movimiento del servo una vez
+ * que exista un lazo de control real: tanto la prueba de banco (barrido
+ * entre límites) como la salida futura del PID (en µs directos, ver
+ * README sección 8) deben llamar esta función en vez de
+ * Servo_SetPulsoUs() directamente, para heredar el límite de
+ * velocidad mecánica.
+ *
+ * @param destinoUs  Ancho de pulso deseado, en µs (se recorta contra
+ *                    SERVO_PULSO_MIN/MAX igual que Servo_SetPulsoUs()).
+ * @return El valor REAL aplicado en este ciclo (después del límite de
+ *         velocidad y del recorte por límites mecánicos).
+ */
+uint16_t Servo_MoverHacia(uint16_t destinoUs);
 
 /** Último ancho de pulso realmente aplicado (después de cualquier
  * recorte por límites). Útil para telemetría/depuración. */

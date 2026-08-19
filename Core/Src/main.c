@@ -204,7 +204,11 @@ int main(void)
 
   Servo_Init(&htim3, TIM_CHANNEL_3);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
-  Servo_SetPulsoUs(1500); /* punto medio, posición segura al arrancar */
+  /* SERVO_PULSO_MIN = posición segura (sin aceleración/ralentí) --
+   * confirmado en el montaje físico real, no es un valor arbitrario.
+   * Se manda de una vez al arrancar (no se conoce la posición previa
+   * del servo, quedó como estuviera al perder alimentación). */
+  Servo_SetPulsoUs(CalibFlash_GetServoPulsoMinUs());
 
   printf("Tacometro STM32G431 - inicio, join LoRaWAN solicitado...\r\n");
 
@@ -391,27 +395,40 @@ int main(void)
   	  }
 
 
+  	  /* Apagado local de seguridad: si el motor arranca mientras se
+  	   * está en modo calibración (CONTROL_HABILITADO=1), se sale de
+  	   * ese modo de inmediato -- sin esperar ningún downlink -- para
+  	   * no seguir moviendo el servo en barrido con el motor operando.
+  	   * Mismo criterio que el resto del firmware (Tacometro_EstaDetenido()),
+  	   * nunca un switch remoto para algo de seguridad física. */
+  	  if (!Tacometro_EstaDetenido() && CalibFlash_GetControlHabilitado()) {
+  		  CalibFlash_SetControlHabilitado(false);
+  	  }
+
   	  /* PRUEBA DE BANCO -- barrido lento del servo entre sus límites
-  	   * configurados, solo para confirmar visualmente el movimiento
-  	   * antes de conectarlo a la varilla real. QUITAR/comentar este
-  	   * bloque una vez que el PID tome el control real del servo. */
-  	  static uint32_t ultimoPasoServo = 0;
-  	  static int16_t direccionServo = 25; /* µs por paso */
-  	  if (HAL_GetTick() - ultimoPasoServo >= 20) { /* un paso cada 20ms */
-  		  ultimoPasoServo = HAL_GetTick();
-  		  uint16_t actual = Servo_GetPulsoActualUs();
+  	   * configurados, solo mientras CONTROL_HABILITADO=1 (modo
+  	   * calibración, ver protocolo de downlinks). QUITAR/comentar este
+  	   * bloque una vez que el PID tome el control real del servo
+  	   * (que deberá llamar Servo_MoverHacia() con su propia salida en
+  	   * vez de este barrido fijo). */
+  	  if (CalibFlash_GetControlHabilitado()) {
+  		  static bool haciaMaximoServo = true;
   		  uint16_t minimo = CalibFlash_GetServoPulsoMinUs();
   		  uint16_t maximo = CalibFlash_GetServoPulsoMaxUs();
-
-  		  int32_t siguiente = (int32_t)actual + direccionServo;
-  		  if (siguiente >= maximo) {
-  			  siguiente = maximo;
-  			  direccionServo = -direccionServo;
-  		  } else if (siguiente <= minimo) {
-  			  siguiente = minimo;
-  			  direccionServo = -direccionServo;
+  		  uint16_t destinoServo = haciaMaximoServo ? maximo : minimo;
+  		  uint16_t aplicadoServo = Servo_MoverHacia(destinoServo);
+  		  if (aplicadoServo == destinoServo) {
+  			  haciaMaximoServo = !haciaMaximoServo;
   		  }
-  		  Servo_SetPulsoUs((uint16_t)siguiente);
+  	  } else {
+  		  /* Fuera de modo calibración: el servo siempre va (o se queda)
+  		   * en SERVO_PULSO_MIN, la posición segura sin aceleración.
+  		   * Cubre tanto el arranque (por defecto CONTROL_HABILITADO=0)
+  		   * como la salida del modo calibración por el apagado de
+  		   * seguridad de arriba -- en ese caso regresa gradualmente
+  		   * (respetando SERVO_VELOCIDAD_MAX_US_S), no de un salto,
+  		   * sin importar en qué punto del barrido se haya quedado. */
+  		  Servo_MoverHacia(CalibFlash_GetServoPulsoMinUs());
   	  }
 
     /* USER CODE END WHILE */

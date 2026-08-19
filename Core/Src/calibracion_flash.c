@@ -314,6 +314,16 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
         }
 
         case CALIB_ID_SERVO_PULSO_MIN: {
+            /* Solo se puede recalibrar el rango del servo en modo
+             * calibracion (CONTROL_HABILITADO=1) -- ademas del bloqueo
+             * general de CONFIGURACION con el motor operando (arriba),
+             * esto evita que un downlink suelto cambie los topes
+             * mecanicos del acelerador fuera de una sesion de banco
+             * deliberada. */
+            if (!CalibFlash_GetControlHabilitado()) {
+                *valorAplicadoRaw = CalibFlash_GetServoPulsoMinUs();
+                return CALIB_STATUS_APPLY_ERROR;
+            }
             uint16_t nuevoValor = LeerUint16BigEndian(datos);
             bool ok = CalibFlash_SetServoPulsoMinUs(nuevoValor);
             *valorAplicadoRaw = CalibFlash_GetServoPulsoMinUs();
@@ -322,6 +332,11 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
         }
 
         case CALIB_ID_SERVO_PULSO_MAX: {
+            /* Ver nota de CALIB_ID_SERVO_PULSO_MIN. */
+            if (!CalibFlash_GetControlHabilitado()) {
+                *valorAplicadoRaw = CalibFlash_GetServoPulsoMaxUs();
+                return CALIB_STATUS_APPLY_ERROR;
+            }
             uint16_t nuevoValor = LeerUint16BigEndian(datos);
             bool ok = CalibFlash_SetServoPulsoMaxUs(nuevoValor);
             *valorAplicadoRaw = CalibFlash_GetServoPulsoMaxUs();

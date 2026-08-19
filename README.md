@@ -216,6 +216,40 @@ Control PWM del servo del acelerador vía **TIM3_CH3 (PB0)**, 50Hz
 fuera de esos límites, sin importar qué tan fuera de rango venga la
 solicitud (ni del downlink, ni de un futuro PID).
 
+`Servo_MoverHacia(destinoUs)` mueve el servo gradualmente hacia
+`destinoUs` sin bloquear, limitando la velocidad a
+`SERVO_VELOCIDAD_MAX_US_S` (µs/segundo, constante fija en `servo.h`,
+no configurable remoto — protección mecánica contra saltos bruscos
+del pulso, ej. ante una corrección fuerte del futuro PID). Calcula el
+paso por tiempo real transcurrido (`HAL_GetTick()`), no por conteo de
+llamadas, así que no depende de la cadencia exacta del loop principal.
+
+**Modo calibración** (`main.c`): con el motor detenido, un downlink
+`CONTROL_HABILITADO=1` activa un barrido continuo del servo entre
+`SERVO_PULSO_MIN` y `SERVO_PULSO_MAX` (vía `Servo_MoverHacia()`) — para
+observar en banco el recorrido físico real mientras se ajustan esos
+dos límites por downlink, con efecto inmediato en el barrido en curso
+(se leen en cada vuelta del loop, no se cachean). Es también el único
+momento en que `SERVO_PULSO_MIN/MAX` se pueden cambiar (fuera de modo
+calibración, se rechazan con `APPLY_ERROR` aunque el motor esté
+apagado). Medida de seguridad: si el motor arranca mientras
+`CONTROL_HABILITADO=1`, el firmware lo fuerza a `0` localmente en el
+mismo ciclo (vía `Tacometro_EstaDetenido()`), sin esperar ningún
+downlink — nunca se deja el barrido corriendo con el motor operando.
+Este bloque de barrido es temporal, pensado para desaparecer cuando
+exista el PID real (que llamará `Servo_MoverHacia()` con su propia
+salida en vez de este barrido fijo).
+
+**Posición segura = `SERVO_PULSO_MIN`** (confirmado en el montaje
+físico real: ese extremo deja el acelerador sin aceleración/ralentí,
+no es un valor arbitrario). Mientras `CONTROL_HABILITADO=0` (arranque,
+o justo después del apagado de seguridad de arriba), el servo siempre
+va o se mantiene ahí — al arrancar se manda de una vez (no se conoce
+la posición previa, quedó como estuviera al perder alimentación); al
+salir del barrido por el apagado de seguridad, regresa gradualmente
+vía `Servo_MoverHacia()` (respetando `SERVO_VELOCIDAD_MAX_US_S`, no de
+un salto), sin importar en qué punto del recorrido se haya quedado.
+
 **Alimentación del servo**: fuente externa 5-6V, GND común con el
 G431, señal PWM a 3.3V (compatible con la mayoría de servos de RC sin
 level shifter).
@@ -349,7 +383,7 @@ downlink fue rechazado, es el valor anterior, no el solicitado.
 | 1 | `OUT_OF_RANGE` | Valor fuera del rango válido |
 | 2 | `UNKNOWN_PARAMETER_ID` | ID no reconocido, o longitud de datos insuficiente |
 | 3 | `STORAGE_ERROR` | Falló la escritura en flash (hardware) |
-| 4 | `APPLY_ERROR` | Reservado, sin uso actual |
+| 4 | `APPLY_ERROR` | Precondición no cumplida (ej. `SERVO_PULSO_MIN/MAX` con `CONTROL_HABILITADO=0`) |
 | 5 | `REJECTED_ENGINE_RUNNING` | Parámetro de categoría CONFIGURACION, motor operando |
 
 ### Tabla completa de parámetros
@@ -364,11 +398,11 @@ downlink fue rechazado, es el valor anterior, no el solicitado.
 | 6 | `PID_KP` | x100 | 2B int16 | Configuración | Con signo |
 | 7 | `PID_KI` | x1000 | 2B int16 | Configuración | Con signo |
 | 8 | `PID_KD` | x1000 | 2B int16 | Configuración | Con signo |
-| 9 | `SERVO_PULSO_MIN` | directo (µs) | 2B uint16 | Configuración | Límite mecánico |
-| 10 | `SERVO_PULSO_MAX` | directo (µs) | 2B uint16 | Configuración | Límite mecánico |
+| 9 | `SERVO_PULSO_MIN` | directo (µs) | 2B uint16 | Configuración | Límite mecánico. Además requiere `CONTROL_HABILITADO=1` (modo calibración) — si no, `APPLY_ERROR` aunque el motor esté apagado |
+| 10 | `SERVO_PULSO_MAX` | directo (µs) | 2B uint16 | Configuración | Igual que `SERVO_PULSO_MIN` |
 | 11 | `TIMEOUT_SIN_COMANDO_S` | directo (s) | 2B uint16 | Configuración | 60-3600s |
 | 12 | `TASA_MAX_CAMBIO_RPM_S` | x10 | 2B uint16 | Configuración | Rampa normal |
-| 13 | `CONTROL_HABILITADO` | flag | 1B | Configuración | Enable/disable lazo de control |
+| 13 | `CONTROL_HABILITADO` | flag | 1B | Configuración | Enable/disable lazo de control. **Modo calibración de servo** mientras no exista el PID: en `1`, corre el barrido de banco entre `SERVO_PULSO_MIN/MAX` (con el motor ya apagado, por la regla general de categoría Configuración) y habilita cambiar esos dos parámetros; el firmware lo fuerza a `0` localmente en el instante que el motor arranca, sin esperar downlink |
 | 14 | `INTERVALO_ENVIO_OPERATIVO_S` | directo (s) | 2B uint16 | Configuración | Uplink en operación |
 | 15 | `INTERVALO_ENVIO_STANDBY_S` | directo (s) | 2B uint16 | Configuración | Uplink en standby |
 | 16 | `MODO` | — | 1B | Configuración | 0=Ralentí, 1=Local, 2=Remoto |
@@ -437,6 +471,35 @@ Modo 2: Remoto        - gobernado por presion del aspersor (downlink PRESION)
   resuelta a nivel de parámetros (`TASA_MAX_CAMBIO_RPM_LLENADO_S` vs.
   `TASA_MAX_CAMBIO_RPM_S`), falta la lógica de conmutación en tiempo
   de ejecución.
+
+### 4.4 Modo calibración del servo (`CONTROL_HABILITADO`, implementada)
+
+Independiente de 4.1-4.3 — no es un modo de operación del motor, es el
+mecanismo para ajustar en banco los topes mecánicos del acelerador
+(`SERVO_PULSO_MIN/MAX`) sin reflashear, descrito en detalle en la
+sección 2.4:
+
+```
+SEGURO       (CONTROL_HABILITADO=0): servo fijo/regresando a
+                                      SERVO_PULSO_MIN (sin aceleración).
+                                      Estado por defecto.
+CALIBRACIÓN  (CONTROL_HABILITADO=1): servo en barrido continuo
+                                      MIN <-> MAX. Requiere motor
+                                      detenido para entrar.
+```
+
+- `SEGURO -> CALIBRACIÓN`: downlink `CONTROL_HABILITADO=1`, solo se
+  acepta con el motor detenido (regla general de 4.1, categoría
+  Configuración) — con el motor operando se rechaza con
+  `REJECTED_ENGINE_RUNNING` (STATUS=5).
+- `CALIBRACIÓN -> SEGURO`: por downlink `CONTROL_HABILITADO=0`, **o**
+  automáticamente en el firmware (sin downlink) si el motor arranca
+  mientras se está calibrando — medida de seguridad, nunca se deja el
+  barrido corriendo con el motor operando.
+- `SERVO_PULSO_MIN/MAX` solo se pueden cambiar por downlink estando en
+  `CALIBRACIÓN`; fuera de ese modo se rechazan con `APPLY_ERROR`
+  (STATUS=4) aunque el motor esté apagado. El cambio tiene efecto
+  inmediato sobre el barrido en curso.
 
 ---
 
