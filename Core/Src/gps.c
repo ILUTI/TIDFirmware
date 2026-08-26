@@ -52,6 +52,12 @@ static float           s_latitud = 0.0f;
 static float           s_longitud = 0.0f;
 static volatile uint32_t s_ultimoFixTickMs = 0;
 
+/* Cuenta reportes "+CGPSINFO:" vacíos (sin fix) SEGUIDOS -- se reinicia
+ * a 0 en cuanto llega un fix real. Al llegar a
+ * GPS_REPORTES_VACIOS_ANTES_DE_REENVIAR, se reenvía "AT+CGPS=1" (ver
+ * GPS_ProcesarCGPSInfo()). */
+static uint16_t s_reportesVaciosSeguidos = 0;
+
 /* ==================== PROTOTIPOS PRIVADOS ==================== */
 
 static void GPS_EncolarLinea(const char *linea, uint16_t len);
@@ -78,6 +84,7 @@ void GPS_Init(UART_HandleTypeDef *huart)
     s_latitud = 0.0f;
     s_longitud = 0.0f;
     s_ultimoFixTickMs = 0;
+    s_reportesVaciosSeguidos = 0;
 
     /* Igual que en RAK3172_Init(): limpiar flags de error y vaciar el
      * registro de datos antes de arrancar, por si quedó algo colgado
@@ -277,6 +284,21 @@ static void GPS_ProcesarCGPSInfo(char *linea)
      * ya es directamente el campo de latitud. */
     if (campos[0][0] == '\0') {
         s_tieneFix = false; /* sin fix -- se conserva la ultima lat/lon conocida */
+
+        s_reportesVaciosSeguidos++;
+        if (s_reportesVaciosSeguidos >= GPS_REPORTES_VACIOS_ANTES_DE_REENVIAR) {
+            s_reportesVaciosSeguidos = 0;
+            /* No es un problema conocido de timing/USB (ver README 2.6) --
+             * esto es solo para reintentar el encendido del motor GNSS por
+             * si el modulo quedo en un estado raro que un simple AT+CGPS=1
+             * pueda destrabar. Si el modulo esta bien y solo le esta
+             * costando conseguir fix (mal clima, sin vista al cielo), este
+             * reenvio es inofensivo -- AT+CGPS=1 con el GPS ya encendido
+             * solo contesta "ERROR" y sigue igual. */
+            printf("GPS: %u reportes seguidos sin fix -- reenviando AT+CGPS=1\r\n",
+                   (unsigned int)GPS_REPORTES_VACIOS_ANTES_DE_REENVIAR);
+            GPS_EnviarComandoAT("AT+CGPS=1");
+        }
         return;
     }
 
@@ -293,6 +315,7 @@ static void GPS_ProcesarCGPSInfo(char *linea)
     s_latitud = lat;
     s_longitud = lon;
     s_tieneFix = true;
+    s_reportesVaciosSeguidos = 0;
     s_ultimoFixTickMs = HAL_GetTick();
 }
 

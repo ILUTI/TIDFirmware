@@ -64,6 +64,11 @@ extern "C" {
 /* Tamaño máximo de un comando AT a transmitir hacia el módulo. */
 #define GPS_TX_BUFFER_SIZE            64U
 
+/* Cantidad de reportes "+CGPSINFO:" vacíos (sin fix) SEGUIDOS antes de
+ * volver a mandar "AT+CGPS=1" -- a un reporte cada 10s (ver
+ * AT+CGPSINFO=10 en main.c), 10 seguidos equivalen a ~100s sin fix. */
+#define GPS_REPORTES_VACIOS_ANTES_DE_REENVIAR   10U
+
 /* ==================== API PÚBLICA ==================== */
 
 /**
