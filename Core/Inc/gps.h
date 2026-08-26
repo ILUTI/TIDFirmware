@@ -1,21 +1,23 @@
 /**
  * @file    gps.h
- * @brief   Módulo de lectura de posición GPS/GNSS del módulo SIM7600X,
- *          vía sentencias NMEA en flujo continuo sobre USART2 (PA2=TX,
- *          PA3=RX).
+ * @brief   Módulo de posición GPS/GNSS del módulo SIM7600X, vía
+ *          auto-reporte periódico "+CGPSINFO:" sobre USART2 (PB3=TX,
+ *          PB4=RX). No transmite NMEA crudo por su cuenta en esta UART
+ *          (confirmado en campo) -- ver gps.c.
  *
  * Diseño de recepción (modo Circular + IDLE):
  *   A diferencia de rak3172.c (modo Normal, comando/respuesta), acá se
  *   usa DMA en modo Circular -- el buffer se rearma solo, y el evento
  *   de línea inactiva (IDLE) dispara el procesamiento de las sentencias
- *   NMEA que el módulo manda por su cuenta de forma continua (no hay
+ *   que el módulo manda por su cuenta de forma continua (no hay
  *   "comando" que esperar como con el RAK3172).
+ *
+ * Armado del auto-reporte: responsabilidad del llamador (main.c),
+ * mandando AT+CGPS=1 y AT+CGPSINFO=10 por GPS_EnviarComandoAT() después
+ * de GPS_Init() -- ver ejemplo en main.c.
  *
  * Uso típico en main.c:
  *   GPS_Init(&huart2);
- *   // Habilitar salida NMEA continua en el módulo -- comando SIN
- *   // CONFIRMAR EN CAMPO todavía, ver advertencia en gps.c:
- *   GPS_EnviarComandoAT("AT+CGPS=1");
  *   ...
  *   while (1) {
  *       GPS_Update();
@@ -32,13 +34,6 @@
  *           GPS_RxEventCallback(huart, Size);
  *       }
  *   }
- *
- * ⚠️ USART2 hoy también es el destino de __io_putchar() (printf de
- * depuración, ver main.c). Mientras eso no se mueva a otro UART (la
- * idea planteada es la VCP del ST-Link), cualquier printf() de la
- * aplicación sale por el mismo cable que espera el SIM7600X y se
- * interpretaría como basura -- no habilitar GPS_Init() en main.c hasta
- * resolver ese conflicto.
  */
 
 #ifndef GPS_H
@@ -111,10 +106,10 @@ void GPS_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size);
 bool GPS_EnviarComandoAT(const char *comando);
 
 /**
- * true si la última sentencia $__RMC procesada trae fix válido (campo
- * de estado 'A'). Se pone en false de nuevo si llega un RMC con
- * estado 'V' (sin fix) -- pero la última posición conocida (lat/lon)
- * se conserva, no se resetea a 0.
+ * true si el último "+CGPSINFO:" procesado trae fix válido (campo de
+ * latitud no vacío). Se pone en false de nuevo si llega un
+ * "+CGPSINFO: ,,,,,,,,," (sin fix) -- pero la última posición conocida
+ * (lat/lon) se conserva, no se resetea a 0.
  */
 bool GPS_TieneFix(void);
 

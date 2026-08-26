@@ -255,7 +255,7 @@ static void GPS_ProcesarSentencia(const char *linea)
         copia[sizeof(copia) - 1] = '\0';
         GPS_ProcesarCGPSInfo(copia);
     }
-    /* Otras líneas ("OK" de arranque, banners, etc.) se ignoran. */
+    /* Otras líneas ("RDY"/"OK" de arranque, banners, etc.) se ignoran. */
 }
 
 static void GPS_ProcesarCGPSInfo(char *linea)
