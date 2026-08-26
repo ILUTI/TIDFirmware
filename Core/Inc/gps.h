@@ -71,9 +71,9 @@ extern "C" {
  * Circular con detección de línea inactiva (IDLE). Llamar una vez en
  * main(), después de que MX_USART2_UART_Init() ya corrió.
  *
- * No envía ningún comando AT por sí sola -- habilitar la salida NMEA
- * del módulo (ver advertencia arriba sobre el comando aún sin
- * confirmar) es responsabilidad del llamador, vía GPS_EnviarComandoAT().
+ * No envía ningún comando AT por sí sola -- armar el auto-reporte
+ * (AT+CGPS=1 + AT+CGPSINFO=10) es responsabilidad del llamador, vía
+ * GPS_EnviarComandoAT() (ver ejemplo en main.c).
  *
  * @param huart   Puntero al handle de USART2 (&huart2 en main.c).
  */
@@ -81,8 +81,8 @@ void GPS_Init(UART_HandleTypeDef *huart);
 
 /**
  * Debe llamarse periódicamente desde el loop principal. Parsea las
- * sentencias NMEA completas encoladas por el callback (actualmente
- * solo $__RMC -- fix, latitud, longitud). No bloquea.
+ * líneas "+CGPSINFO:" completas encoladas por el callback (fix,
+ * latitud, longitud). No bloquea.
  */
 void GPS_Update(void);
 
@@ -97,8 +97,9 @@ void GPS_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size);
 /**
  * Envía un comando AT crudo al módulo (se agrega "\r\n" internamente),
  * de forma bloqueante -- igual que RAK3172_EnviarComandoAT(), pero acá
- * no hay que esperar una respuesta "OK"/"ERROR" explícita porque el
- * flujo NMEA no sigue ese protocolo de comando/respuesta.
+ * no hay que esperar una respuesta "OK"/"ERROR" explícita: una vez
+ * armado el auto-reporte, el flujo de "+CGPSINFO:" es un URC
+ * periódico, no un protocolo de comando/respuesta.
  *
  * @param comando   Comando AT sin terminador, ej. "AT+CGPS=1".
  * @return true si se pudo transmitir, false si el comando es muy largo.
