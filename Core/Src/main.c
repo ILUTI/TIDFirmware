@@ -25,8 +25,10 @@
 #include "calibracion_flash.h"
 #include "rak3172.h"
 #include "servo.h"
+#include "pid.h"
 #include "rtc_reloj.h"
 #include "gps.h"
+#include "comando_serial.h"
 #include <stdio.h>
 /* USER CODE END Includes */
 
@@ -38,6 +40,37 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define INTERVALO_ENVIO_RPM_MS   30000U   // mandar RPM cada 30 segundos
+
+/* El RTC de este nodo corre del LSI interno (~32kHz nominal, sin cristal
+ * externo -- ver hallazgos de hardware), que no esta calibrado ni
+ * compensado por temperatura. Deriva medida en campo: ~0.8% (equivale a
+ * ~12 min/dia sin correccion). Por eso se resincroniza periodicamente
+ * en vez de una sola vez al arrancar -- ver bloque de sincronizacion en
+ * el superloop.
+ *
+ * Fuente PRIMARIA: hora UTC del propio GPS (satelital, mas precisa, y
+ * no compite por el canal AT del RAK3172 ni gasta duty cycle) -- se
+ * intenta cada INTERVALO_RESYNC_GPS_MS si hay fix vivo. Ese intervalo
+ * se dejo igual al de envio de RPM (30s) porque intentarlo no cuesta
+ * nada -- el modulo SIM7600X igual solo refresca su propio reporte
+ * cada 10s (AT+CGPSINFO=10), asi que preguntar mas seguido no trae
+ * dato mas fresco.
+ * Fuente de RESPALDO: DeviceTimeReq por LoRaWAN -- compite libremente
+ * con el GPS para el primer sync (el que llegue primero gana). Una vez
+ * que YA hubo un sync exitoso (de cualquier fuente), el respaldo por
+ * LoRa se limita a activarse solo si pasan INTERVALO_FALLBACK_LORA_MS
+ * sin ningun resync exitoso nuevo (ej. GPS sin vista al cielo por un
+ * rato largo) -- para no competir por el canal AT del RAK3172 sin
+ * necesidad mientras el GPS este sincronizando bien. */
+#define INTERVALO_RESYNC_GPS_MS      INTERVALO_ENVIO_RPM_MS   // intentar resync por GPS cada vez que se manda RPM (30s)
+#define INTERVALO_FALLBACK_LORA_MS   (30UL * 60UL * 1000UL)   // forzar resync por LoRaWAN si no hay exito en 30 min
+
+/* El propio RAK3172 ya reintenta el join 8 veces cada 10s dentro de UN
+ * solo comando (ver AT+JOIN=1:0:10:8 en RAK3172_Join(), ~80s en total),
+ * pero si esas 8 fallan (o el modulo se queda sin cobertura un rato)
+ * nada volvia a pedir el join de nuevo -- el nodo quedaba sin unirse
+ * para siempre. 2 min da margen sobre esos ~80s antes de reintentar. */
+#define INTERVALO_REINTENTO_JOIN_MS  (120UL * 1000UL)
 /* ⚠️ SUPUESTO / placeholder: por ahora hardcodeado a 1 (equivale a
  * "DSL-0001"). Cuando exista mas de un nodo motor, resolver esto desde
  * CalibFlash_GetNodeId() (ID 18, NODE_ID) en vez de una constante. */
@@ -151,56 +184,66 @@ int main(void)
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
   HAL_TIM_IC_Start(&htim2, TIM_CHANNEL_2);
 
-  /* RAK3172 en USART1 (PA9/PA10) */
+  /* RAK3172 en USART1 (PA9/PA10). LoRa es prioridad ante todo lo demas
+   * en el arranque -- se inicializa y se pide el join ANTES del GPS,
+   * para que el join salga lo antes posible y no compita con los
+   * HAL_Delay() bloqueantes del bring-up del GPS (~2.5s). */
   RAK3172_Init(&huart1);
 
-  /* GPS (SIM7600X) en USART2 (PB3/PB4) -- ver gps.h */
+  HAL_Delay(500);  // dar tiempo al RAK3172 a terminar su propio arranque
+
+  /* AT+MASK=0002 (sub-banda 2): fix real y necesario para el bug
+   * documentado de RUI3 en US915 (con AT+MASK=00FF el join falla con
+   * AT_ERROR) -- NO es diagnostico, se queda. Las 8 consultas de
+   * solo lectura que corrian aca (AT+NWM=?, AT+NJM=?, etc.) SI eran
+   * diagnostico puro para confirmar el provisioning durante el
+   * bring-up -- se quitaron (2026-08-18) porque cada una podia
+   * esperar hasta 3s, sumando varios segundos al arranque sin
+   * aportar nada ahora que el problema de join ya esta resuelto. */
+  RAK3172_EnviarComandoAT("AT+MASK=0002");
+  {
+      uint32_t inicioEspera = HAL_GetTick();
+      while (!RAK3172_ComandoListo() && (HAL_GetTick() - inicioEspera) < 3000U) {
+          RAK3172_Update();
+      }
+  }
+  /* Impreso aparte (con etiqueta) porque el reporte generico de
+   * "resultado=" en el loop principal no distingue de que comando fue
+   * -- para ese momento ya se sobreescribe con el resultado del JOIN
+   * de abajo, y un AT+MASK que fallo (ERROR/TIMEOUT) quedaba invisible
+   * en el log. */
+  printf("RAK3172: AT+MASK=0002 -> resultado=%d (0=OK,1=ERROR,2=TIMEOUT,3=BUSY)\r\n",
+         RAK3172_GetUltimoResultado());
+
+  RAK3172_Join();
+
+  /* GPS (SIM7600X) en USART2 (PB3/PB4) -- ver gps.h. Va DESPUES del
+   * join de LoRa a proposito (ver comentario arriba). */
   GPS_Init(&huart2);
 
   HAL_Delay(500);  // dar tiempo al SIM7600X a terminar su propio arranque
 
-  /* Enciende el motor GNSS. Confirmado en campo (2026-08-18) via
-   * USB-TTL directo al modulo: contesta "OK" (o "ERROR" si ya estaba
-   * encendido de una sesion anterior -- inofensivo, ver nota de abajo). */
+  /* AT+CGPSCOLD se probo (2026-08-25) para forzar un cold start
+   * explicito -- devolvio ERROR, descartado (no soportado en esta
+   * version de firmware del modulo). Vuelto a AT+CGPS=1. Contesta
+   * "OK" (arranque en frio) o "ERROR" (ya estaba encendido de una
+   * sesion previa) -- inofensivo. */
   GPS_EnviarComandoAT("AT+CGPS=1");
 
-  /* Pausa necesaria entre comandos -- confirmada en campo (2026-08-18):
-   * sin esta espera, tras un "ERROR" a AT+CGPS=1 (GPS ya encendido de
-   * una sesion previa) el modulo dejaba de contestar CUALQUIER cosa,
-   * ni siquiera el eco de AT+CGPSINFO=10 mandado justo despues -- el
-   * modulo necesita este instante para terminar de procesar/
-   * estabilizarse antes de aceptar el siguiente comando. */
+  /* Pausa necesaria entre comandos -- sin ella, el modulo deja de
+   * contestar cualquier cosa, ni siquiera el eco de AT+CGPSINFO=10
+   * mandado justo despues. NO es la causa del bug de "nunca da fix
+   * tras un corte real" que se investigo extensamente (2026-08-25) --
+   * esa causa resulto ser el cable USB del Nucleo a la PC metiendo
+   * ruido al plano de tierra mientras el GNSS intenta enganchar
+   * satelites (ver README seccion 2.6) -- no timing de comandos. */
   HAL_Delay(1500);
 
   /* Habilita el auto-reporte periodico de posicion cada 10 segundos --
    * a partir de aca el modulo manda "+CGPSINFO: ..." por su cuenta
-   * (URC), sin que el host tenga que volver a pedirlo. Confirmado que
-   * este modulo NO transmite NMEA crudo espontaneamente por esta UART;
-   * "AT+CGPSINFO=<1-255>" es el mecanismo real de auto-reporte (ver
-   * gps.c). Ajustar el intervalo (10) si se necesita una posicion mas
-   * fresca o se quiere reducir el trafico en la UART. */
+   * (URC), sin que el host tenga que volver a pedirla. */
   GPS_EnviarComandoAT("AT+CGPSINFO=10");
   printf("GPS: inicializado en USART2, auto-reporte cada 10s habilitado\r\n");
-
-    HAL_Delay(500);  // dar tiempo al RAK3172 a terminar su propio arranque
-
-    /* AT+MASK=0002 (sub-banda 2): fix real y necesario para el bug
-     * documentado de RUI3 en US915 (con AT+MASK=00FF el join falla con
-     * AT_ERROR) -- NO es diagnostico, se queda. Las 8 consultas de
-     * solo lectura que corrian aca (AT+NWM=?, AT+NJM=?, etc.) SI eran
-     * diagnostico puro para confirmar el provisioning durante el
-     * bring-up -- se quitaron (2026-08-18) porque cada una podia
-     * esperar hasta 3s, sumando varios segundos al arranque sin
-     * aportar nada ahora que el problema de join ya esta resuelto. */
-    RAK3172_EnviarComandoAT("AT+MASK=0002");
-    {
-        uint32_t inicioEspera = HAL_GetTick();
-        while (!RAK3172_ComandoListo() && (HAL_GetTick() - inicioEspera) < 3000U) {
-            RAK3172_Update();
-        }
-    }
-
-    RAK3172_Join();
 
   Servo_Init(&htim3, TIM_CHANNEL_3);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
@@ -209,6 +252,11 @@ int main(void)
    * Se manda de una vez al arrancar (no se conoce la posición previa
    * del servo, quedó como estuviera al perder alimentación). */
   Servo_SetPulsoUs(CalibFlash_GetServoPulsoMinUs());
+
+  /* Mando manual TEMPORAL por el mismo puerto de debug (LPUART1),
+   * mientras no hay red LoRa en campo para probar downlinks reales --
+   * ver comando_serial.h. Quitar cuando ya no se necesite. */
+  ComandoSerial_Init(&hlpuart1);
 
   printf("Tacometro STM32G431 - inicio, join LoRaWAN solicitado...\r\n");
 
@@ -222,6 +270,7 @@ int main(void)
 	  Tacometro_Update();
   	  RAK3172_Update();
   	  GPS_Update();
+  	  ComandoSerial_Update();
 
   	  /* Persiste la primera posicion valida del arranque en flash --
   	   * una sola vez, no en cada actualizacion cada 10s (desgastaria
@@ -236,27 +285,95 @@ int main(void)
   		         GPS_GetLatitud(), GPS_GetLongitud());
   	  }
 
-  	  /* Aviso una sola vez cuando el join se confirme */
-  	  static bool yaAvisoJoin = false;
-  	  if (!yaAvisoJoin && RAK3172_EstaUnido()) {
-  		  yaAvisoJoin = true;
+  	  /* Aviso cuando el join se confirme -- por FLANCO (no unido ->
+  	   * unido), no una sola vez para siempre: si el modulo se
+  	   * reinicia solo y pierde el join a mitad de sesion (ver
+  	   * "AT_NO_NETWORK_JOINED" en rak3172.c, que apaga
+  	   * RAK3172_EstaUnido()), este aviso debe poder repetirse cuando
+  	   * se vuelva a unir. */
+  	  static bool estabaUnidoAntes = false;
+  	  bool estaUnidoAhora = RAK3172_EstaUnido();
+  	  if (!estabaUnidoAntes && estaUnidoAhora) {
   		  printf("RAK3172: unido a la red LoRaWAN (+EVT:JOINED)\r\n");
   	  }
+  	  estabaUnidoAntes = estaUnidoAhora;
 
-  	  /* ================== Sincronizacion de hora (DeviceTimeReq) ==================
-  	   * Secuencia: 1) una vez unido, pedir la hora (AT+TIMEREQ=1); 2) esperar
-  	   * a que un uplink la traiga de vuelta (+EVT:TIMEREQ); 3) consultar el
-  	   * valor (AT+LTIME=?) y setear el RTC. Se reintenta solo una vez por
-  	   * arranque -- si falla, Reloj_EstaSincronizado() sigue en false y el
-  	   * uplink LIVE queda pausado (ver mas abajo) hasta el proximo intento
-  	   * manual/reset. */
+  	  /* Reintento de join: sin esto, si los 8 intentos internos del
+  	   * modulo (AT+JOIN=1:0:10:8) fallan o nunca llego un +EVT:JOINED
+  	   * (ej. sin cobertura un rato en el arranque), el nodo se quedaba
+  	   * sin unir para siempre -- nada volvia a pedir el join de nuevo.
+  	   *
+  	   * Se reafirma AT+MASK=0002 justo antes de cada reintento (no solo
+  	   * la vez del arranque): si ese comando fallo silenciosamente en
+  	   * el arranque (visto en campo: "resultado=1/ERROR" ahi), el join
+  	   * se quedaria fallando para siempre por el mismo bug de sub-banda
+  	   * ya documentado (ver hallazgos de hardware), sin que este
+  	   * reintento lo pudiera arreglar. Maquina de 2 pasos no bloqueante
+  	   * (MASK, despues JOIN) para no frenar el resto del loop. */
+  	  static uint32_t ultimoIntentoJoinTick = 0;
+  	  static bool reenviandoMaskAntesDeJoin = false;
+  	  if (reenviandoMaskAntesDeJoin && RAK3172_ComandoListo()) {
+  		  reenviandoMaskAntesDeJoin = false;
+  		  printf("RAK3172: aun no unido a la red -- reintentando join (AT+JOIN)\r\n");
+  		  RAK3172_Join();
+  	  } else if (!RAK3172_EstaUnido() && !reenviandoMaskAntesDeJoin && RAK3172_ComandoListo() &&
+  			  (HAL_GetTick() - ultimoIntentoJoinTick >= INTERVALO_REINTENTO_JOIN_MS)) {
+  		  ultimoIntentoJoinTick = HAL_GetTick();
+  		  printf("RAK3172: aun no unido a la red -- reafirmando AT+MASK=0002 antes de reintentar join\r\n");
+  		  RAK3172_EnviarComandoAT("AT+MASK=0002");
+  		  reenviandoMaskAntesDeJoin = true;
+  	  }
+
+  	  /* ================== Sincronizacion de hora: GPS (primaria) + LoRaWAN (respaldo) ==================
+  	   * Ver definicion de INTERVALO_RESYNC_GPS_MS / INTERVALO_FALLBACK_LORA_MS
+  	   * arriba para el porque de la redundancia. */
+  	  static uint32_t ultimoIntentoGpsTick = 0;
+  	  static uint32_t ultimoResyncExitosoTick = 0;
+  	  static bool huboResyncAlgunaVez = false;
+  	  bool relojFueCorregidoEsteCiclo = false;
+
+  	  /* --- Fuente primaria: GPS. Antes del primer sync (de cualquier
+  	   * fuente) se intenta en CADA vuelta del loop, no cada 10 min, para
+  	   * no perder tiempo esperando si el fix ya esta disponible. */
+  	  bool tocaIntentarGps = (HAL_GetTick() - ultimoIntentoGpsTick >= INTERVALO_RESYNC_GPS_MS) ||
+  			  !Reloj_EstaSincronizado();
+
+  	  if (tocaIntentarGps) {
+  		  ultimoIntentoGpsTick = HAL_GetTick();
+
+  		  uint16_t anioGps; uint8_t mesGps, diaGps, horaGps, minutoGps, segundoGps;
+  		  if (GPS_GetFechaHoraUtc(&anioGps, &mesGps, &diaGps, &horaGps, &minutoGps, &segundoGps)) {
+  			  Reloj_SetHoraUtc(anioGps, mesGps, diaGps, horaGps, minutoGps, segundoGps);
+  			  CalibFlash_SetUltimaHoraUtcConocida(Reloj_GetUnixTimeUtc());
+  			  relojFueCorregidoEsteCiclo = true;
+  			  ultimoResyncExitosoTick = HAL_GetTick();
+  			  huboResyncAlgunaVez = true;
+  			  printf("GPS: reloj sincronizado con hora satelital: %02u:%02u:%02u UTC, %02u/%02u/%04u\r\n",
+  					 horaGps, minutoGps, segundoGps, mesGps, diaGps, anioGps);
+  		  }
+  	  }
+
+  	  /* --- Fuente de respaldo: DeviceTimeReq por LoRaWAN. Antes del
+  	   * primer sync (de cualquier fuente) compite libremente con el GPS
+  	   * -- el que llegue primero gana. Despues del primer sync, se
+  	   * limita a activarse solo si ya paso INTERVALO_FALLBACK_LORA_MS
+  	   * desde el ultimo resync exitoso sin que el GPS lo haya logrado --
+  	   * ej. antena sin vista al cielo por un rato largo. */
+  	  bool necesitaFallbackLora = !huboResyncAlgunaVez ||
+  			  (HAL_GetTick() - ultimoResyncExitosoTick >= INTERVALO_FALLBACK_LORA_MS);
+
   	  static bool horaSolicitada = false;
   	  static bool horaConsultada = false;
 
-  	  if (RAK3172_EstaUnido() && !horaSolicitada && RAK3172_ComandoListo()) {
+  	  if (RAK3172_EstaUnido() && necesitaFallbackLora && !horaSolicitada && RAK3172_ComandoListo()) {
   		  horaSolicitada = RAK3172_SolicitarHoraRed();
   		  if (horaSolicitada) {
-  			  printf("RAK3172: hora de red solicitada (AT+TIMEREQ=1), esperando proximo uplink...\r\n");
+  			  if (huboResyncAlgunaVez) {
+  				  printf("RAK3172: sin resync por GPS en %lu min -- solicitando hora de red como respaldo (AT+TIMEREQ=1)\r\n",
+  						 (unsigned long)(INTERVALO_FALLBACK_LORA_MS / 60000UL));
+  			  } else {
+  				  printf("RAK3172: hora de red solicitada (AT+TIMEREQ=1), compitiendo con el GPS por el primer sync...\r\n");
+  			  }
   		  }
   	  }
 
@@ -264,7 +381,7 @@ int main(void)
   		  horaConsultada = RAK3172_ConsultarHoraRed();
   	  }
 
-  	  if (horaConsultada && !Reloj_EstaSincronizado() && RAK3172_ComandoListo()) {
+  	  if (horaConsultada && RAK3172_ComandoListo()) {
 		  char respuesta[RAK3172_RX_BUFFER_SIZE];
 		  if (RAK3172_GetUltimaRespuesta(respuesta, sizeof(respuesta))) {
 			  /* Formato REAL confirmado en campo (2026-08-17):
@@ -278,12 +395,20 @@ int main(void)
 				  Reloj_SetHoraUtc((uint16_t)anio, (uint8_t)mes, (uint8_t)dia,
 								   (uint8_t)hora, (uint8_t)minuto, (uint8_t)segundo);
 				  CalibFlash_SetUltimaHoraUtcConocida(Reloj_GetUnixTimeUtc());
-				  printf("Reloj sincronizado con la red: %02u:%02u:%02u UTC, %02u/%02u/%04u\r\n",
+				  relojFueCorregidoEsteCiclo = true;
+				  ultimoResyncExitosoTick = HAL_GetTick();
+				  huboResyncAlgunaVez = true;
+				  printf("RAK3172: reloj sincronizado con la red (respaldo): %02u:%02u:%02u UTC, %02u/%02u/%04u\r\n",
 						 hora, minuto, segundo, mes, dia, anio);
 			  } else {
 				  printf("RAK3172: respuesta de AT+LTIME=? no reconocida: '%s'\r\n", respuesta);
 			  }
 		  }
+		  /* Listo para el proximo ciclo (exito o fallo -- si fallo,
+		   * necesitaFallbackLora sigue en true y se reintenta en la
+		   * proxima vuelta del loop en vez de quedar trabado). */
+		  horaSolicitada = false;
+		  horaConsultada = false;
 	  }
 
   	  /* ================== Estado del motor + uplink LIVE extendido ==================
@@ -295,23 +420,21 @@ int main(void)
   	  static uint8_t estadoAnterior = ESTADO_APAGADO;
 	  static uint32_t inicioEstadoLocal = 0;
 	  static bool estadoInicializado = false;
-	  static bool relojSincronizadoAnterior = false;
 	  static uint32_t fechaHoraLocalIterAnterior = 0;
 
 	  float rpmActual = Tacometro_GetRPMFiltrada();
 	  uint8_t estadoActual = (rpmActual > 0.0f) ? ESTADO_ENCENDIDO : ESTADO_APAGADO;
 
 	  uint32_t fechaHoraLocalIterActual = Reloj_GetUnixTimeLocal();
-	  bool relojRecienSincronizado = (!relojSincronizadoAnterior && Reloj_EstaSincronizado());
-	  relojSincronizadoAnterior = Reloj_EstaSincronizado();
 
 	  if (!estadoInicializado || estadoActual != estadoAnterior) {
 		  estadoAnterior = estadoActual;
 		  inicioEstadoLocal = fechaHoraLocalIterActual;
 		  estadoInicializado = true;
-	  } else if (relojRecienSincronizado) {
-		  /* El reloj acaba de saltar de un valor aproximado/placeholder
-		   * al real -- si el estado NO cambio, desplazar el ancla por
+	  } else if (relojFueCorregidoEsteCiclo) {
+		  /* El reloj se acaba de corregir (primer sync desde un valor
+		   * aproximado/placeholder, o resync periodico contra la deriva
+		   * del LSI) -- si el estado NO cambio, desplazar el ancla por
 		   * el mismo salto en vez de reiniciarla a "ahora", para no
 		   * perder el tiempo ya transcurrido en el estado actual (ej.
 		   * el motor llevaba apagado un rato desde el arranque, y la
@@ -374,13 +497,20 @@ int main(void)
   	   * el comando se recibe y se valida (requiere byte de
   	   * confirmación 0xA5), pero no dispara ninguna acción. */
 
-  	  /* Reporte de resultado del último comando AT (join o send) */
-  	  static RAK3172_Resultado_t ultimoResultadoMostrado = (RAK3172_Resultado_t)-1;
-  	  RAK3172_Resultado_t resultadoActual = RAK3172_GetUltimoResultado();
-  	  if (RAK3172_ComandoListo() && resultadoActual != ultimoResultadoMostrado) {
-  		  ultimoResultadoMostrado = resultadoActual;
-  		  printf("RAK3172: resultado=%d (0=OK,1=ERROR,2=TIMEOUT,3=BUSY)\r\n", resultadoActual);
+  	  /* Reporte de resultado del último comando AT (join o send).
+  	   * ⚠️ Detecta el FLANCO de "comando recien terminado" (en_curso ->
+  	   * listo), NO un cambio de VALOR -- con el chequeo viejo
+  	   * (imprimir solo si resultadoActual != el ultimo mostrado), dos
+  	   * comandos consecutivos con el MISMO resultado (ej. TIMEOUT tras
+  	   * TIMEOUT si el modulo deja de responder) se volvian invisibles
+  	   * despues del primero: el log parecia "dejo de intentar" cuando
+  	   * en realidad seguia intentando y fallando cada vez igual. */
+  	  static bool comandoEnCursoAnterior = true;
+  	  bool comandoEnCursoAhora = !RAK3172_ComandoListo();
+  	  if (comandoEnCursoAnterior && !comandoEnCursoAhora) {
+  		  printf("RAK3172: resultado=%d (0=OK,1=ERROR,2=TIMEOUT,3=BUSY)\r\n", RAK3172_GetUltimoResultado());
   	  }
+  	  comandoEnCursoAnterior = comandoEnCursoAhora;
 
   	  static uint32_t ultimoReporte = 0;
   	  if (HAL_GetTick() - ultimoReporte >= 1000) {
@@ -394,42 +524,198 @@ int main(void)
   			  Reloj_EstaSincronizado());
   	  }
 
-
-  	  /* Apagado local de seguridad: si el motor arranca mientras se
-  	   * está en modo calibración (CONTROL_HABILITADO=1), se sale de
-  	   * ese modo de inmediato -- sin esperar ningún downlink -- para
-  	   * no seguir moviendo el servo en barrido con el motor operando.
-  	   * Mismo criterio que el resto del firmware (Tacometro_EstaDetenido()),
-  	   * nunca un switch remoto para algo de seguridad física. */
-  	  if (!Tacometro_EstaDetenido() && CalibFlash_GetControlHabilitado()) {
-  		  CalibFlash_SetControlHabilitado(false);
+  	  /* Log de alta frecuencia para identificar el modelo de la planta
+  	   * (motor+servo) y probar escalones de SET_RPM -- ver README
+  	   * sección 9. Prefijo "PID_TEST," fijo para poder filtrar estas
+  	   * líneas con un script (ignorando el resto del log, que sigue
+  	   * intercalado) sin parsear el resto del texto.
+  	   * Usa HAL_GetTick() (ms desde el arranque) y no la hora del RTC a
+  	   * propósito: el RTC se resincroniza cada ~30s por GPS/LoRaWAN (ver
+  	   * sección 2.2) y esos saltos de corrección contaminarían el
+  	   * tiempo relativo de un escalón en curso -- HAL_GetTick() es
+  	   * monótono y no depende de si el reloj ya sincronizó.
+  	   *
+  	   * Gateado por CONTROL_HABILITADO==3 (modo sintonización PID, ver
+  	   * README sección 4.4/9): fuera de ese modo esto no imprime nada
+  	   * (el monitor se ve igual que antes de que existiera este log).
+  	   * Se apaga solo en cuanto se sale del modo 3 (a diferencia de una
+  	   * bandera de una sola vía, sigue el mismo estado que ya gatea si
+  	   * PID_KP/KI/KD se pueden tocar -- una sola fuente de verdad). */
+  	  static uint32_t ultimoLogPrueba = 0;
+  	  if (CalibFlash_GetControlHabilitado() == 3U && HAL_GetTick() - ultimoLogPrueba >= 200U) {
+  		  ultimoLogPrueba = HAL_GetTick();
+  		  printf("PID_TEST,%lu,%.1f,%.1f,%u\r\n",
+  			  (unsigned long)HAL_GetTick(),
+  			  CalibFlash_GetSetRpm(),
+  			  Tacometro_GetRPMFiltrada(),
+  			  Servo_GetPulsoActualUs());
   	  }
 
-  	  /* PRUEBA DE BANCO -- barrido lento del servo entre sus límites
-  	   * configurados, solo mientras CONTROL_HABILITADO=1 (modo
-  	   * calibración, ver protocolo de downlinks). QUITAR/comentar este
-  	   * bloque una vez que el PID tome el control real del servo
-  	   * (que deberá llamar Servo_MoverHacia() con su propia salida en
-  	   * vez de este barrido fijo). */
-  	  if (CalibFlash_GetControlHabilitado()) {
+  	  /* Log de calibración del servo -- gateado a CONTROL_HABILITADO=1
+  	   * (barrido) o =2 (manual), ver README sección 2.4/4.4. Antes de
+  	   * esto, la única forma de saber los límites vigentes en banco era
+  	   * el ACK de cada downlink de SERVO_PULSO_MIN/MAX ("valor
+  	   * vigente=X") -- esto muestra en vivo, mientras se observa el
+  	   * servo moverse, dónde están los límites configurados y qué pulso
+  	   * se le está aplicando en ese instante. Cadencia de 1s (a
+  	   * diferencia de PID_TEST, esto es solo para lectura humana, no se
+  	   * analiza después con un script). */
+  	  static uint32_t ultimoLogServoCal = 0;
+  	  uint8_t modoParaLogServo = CalibFlash_GetControlHabilitado();
+  	  if ((modoParaLogServo == 1U || modoParaLogServo == 2U) &&
+  	      HAL_GetTick() - ultimoLogServoCal >= 1000U) {
+  		  ultimoLogServoCal = HAL_GetTick();
+  		  printf("SERVO_CAL,min=%uus,max=%uus,pulso_actual=%uus\r\n",
+  			  CalibFlash_GetServoPulsoMinUs(),
+  			  CalibFlash_GetServoPulsoMaxUs(),
+  			  Servo_GetPulsoActualUs());
+  	  }
+
+
+  	  /* Apagado local de seguridad: si el motor arranca mientras se
+  	   * está en modo de calibración del SERVO (CONTROL_HABILITADO=1 o
+  	   * =2), se sale de inmediato -- sin esperar ningún downlink -- para
+  	   * no seguir moviendo el servo (en barrido o manual) con el motor
+  	   * operando. Mismo criterio que el resto del firmware
+  	   * (Tacometro_EstaDetenido()), nunca un switch remoto para algo de
+  	   * seguridad física.
+  	   * NO incluye el modo 3 (sintonización de PID) a propósito: ese
+  	   * modo necesita que el motor siga operando durante toda la
+  	   * sesión (README sección 9) -- el servo en modo 3 lo maneja el
+  	   * PID normal exactamente igual que en modo 0, así que no hay
+  	   * barrido/posición manual que "se quede corriendo" sin control. */
+  	  uint8_t modoCalibracionServo = CalibFlash_GetControlHabilitado();
+  	  if (!Tacometro_EstaDetenido() && (modoCalibracionServo == 1U || modoCalibracionServo == 2U)) {
+  		  CalibFlash_SetControlHabilitado(0U);
+  		  CalibFlash_LimpiarObjetivoManualServo(); /* invalida cualquier
+  		                                             * objetivo manual pendiente,
+  		                                             * no arrastrarlo a una
+  		                                             * futura sesion de calibracion */
+  		  CalibFlash_SetSetRpm(0.0f); /* mismo criterio que al ENTRAR a 1/2/3
+  		                                 * (calibracion_flash.c) -- si habia
+  		                                 * quedado un SET_RPM viejo mandado
+  		                                 * mientras se calibraba el servo, no
+  		                                 * debe activar el PID solo al volver
+  		                                 * a modo 0 por este apagado de
+  		                                 * seguridad. */
+  	  }
+
+  	  /* PRUEBA DE BANCO -- servo en modo calibración mientras
+  	   * CONTROL_HABILITADO != 0 (ver protocolo de downlinks): =1 barrido
+  	   * automático MIN<->MAX, =2 manual (se queda quieto salvo un
+  	   * downlink nuevo de SERVO_PULSO_MIN/MAX), =3 sintonización de PID
+  	   * (el servo NO cambia de comportamiento respecto a =0 -- sigue
+  	   * siendo pid.c quien lo maneja -- lo único que cambia con =3 es
+  	   * que se desbloquean PID_KP/KI/KD y se activa el log PID_TEST, ver
+  	   * calibracion_flash.c). QUITAR/comentar este bloque si algún día
+  	   * se retira también la calibración remota. */
+  	  bool motorOperandoAhora = !Tacometro_EstaDetenido();
+  	  float setpointRpmCrudo = CalibFlash_GetSetRpm();
+  	  float rpmMin = CalibFlash_GetRpmMin();
+  	  float rpmMax = CalibFlash_GetRpmMax();
+
+  	  /* Modo 0 (ralentí) = sin control activo: el motor sube solo de
+  	   * 0Hz a su ralentí natural (distinto en cada unidad, por eso
+  	   * RPM_MIN es "límite duro / ralentí" y no una constante) sin que
+  	   * el PID intervenga -- el servo se queda quieto en
+  	   * SERVO_PULSO_MIN. El lazo solo se activa si se comanda
+  	   * explícitamente un SET_RPM por encima de ese ralentí
+  	   * configurado; un SET_RPM en 0 (default sin comandar, ver
+  	   * CalibFlash_Init) o apenas unos pocos RPM nunca debe forzar el
+  	   * servo. */
+  	  bool controlSolicitado = setpointRpmCrudo > rpmMin;
+
+  	  uint8_t modoControl = CalibFlash_GetControlHabilitado(); /* 0=desactivado, 1=barrido, 2=manual, 3=sintonizacion PID */
+
+  	  static bool pidActivoAntes = false;
+  	  /* Modo 3 (sintonizacion PID) usa el MISMO camino de control que el
+  	   * modo 0 -- el servo lo maneja pid.c igual en ambos casos, la unica
+  	   * diferencia es que en modo 3 ademas se permite tocar PID_KP/KI/KD
+  	   * (ver calibracion_flash.c) y se activa el log PID_TEST de mas
+  	   * arriba. No hace falta un branch aparte para 3 en el if/else de
+  	   * abajo -- como no es 1 ni 2, cae solo en esta rama. */
+  	  bool pidActivoAhora = (modoControl == 0U || modoControl == 3U) && motorOperandoAhora && controlSolicitado;
+  	  if (pidActivoAhora && !pidActivoAntes) {
+  		  PID_Init(); /* flanco de entrada -- evita un dt inflado por tiempo inactivo */
+  	  }
+  	  pidActivoAntes = pidActivoAhora;
+
+  	  static uint8_t modoControlAnterior = 0U;
+
+  	  if (modoControl == 1U) {
+  		  /* Pausa en cada extremo (SERVO_BARRIDO_PAUSA_EXTREMOS_MS,
+  		   * servo.h) antes de invertir direccion -- el pulso PWM llega
+  		   * exacto al limite en cuanto Servo_MoverHacia() lo reporta,
+  		   * pero el servo fisico tiene su propio tiempo de asentamiento;
+  		   * sin esta espera, el firmware invertia la marcha en la misma
+  		   * vuelta del loop en que el pulso llegaba al extremo, y el
+  		   * brazo real nunca alcanzaba a terminar de llegar. */
   		  static bool haciaMaximoServo = true;
+  		  static bool esperandoEnExtremo = false;
+  		  static uint32_t inicioEsperaExtremoMs = 0;
   		  uint16_t minimo = CalibFlash_GetServoPulsoMinUs();
   		  uint16_t maximo = CalibFlash_GetServoPulsoMaxUs();
   		  uint16_t destinoServo = haciaMaximoServo ? maximo : minimo;
   		  uint16_t aplicadoServo = Servo_MoverHacia(destinoServo);
-  		  if (aplicadoServo == destinoServo) {
+  		  if (!esperandoEnExtremo) {
+  			  if (aplicadoServo == destinoServo) {
+  				  esperandoEnExtremo = true;
+  				  inicioEsperaExtremoMs = HAL_GetTick();
+  			  }
+  		  } else if (HAL_GetTick() - inicioEsperaExtremoMs >= SERVO_BARRIDO_PAUSA_EXTREMOS_MS) {
   			  haciaMaximoServo = !haciaMaximoServo;
+  			  esperandoEnExtremo = false;
   		  }
+  	  } else if (modoControl == 2U) {
+  		  /* Modo manual de calibración (CONTROL_HABILITADO=2): a
+  		   * diferencia del barrido (=1), el servo se queda quieto en su
+  		   * posición -- solo se mueve cuando llega un downlink de
+  		   * SERVO_PULSO_MIN o SERVO_PULSO_MAX, yendo directo a ese valor
+  		   * (para posicionar el servo en un punto exacto durante el
+  		   * ajuste en banco, sin esperar una vuelta completa del
+  		   * barrido). El "llegó un downlink nuevo" se consume como
+  		   * bandera (CalibFlash_HayObjetivoManualServo(), fijada en
+  		   * calibracion_flash.c en el momento del downlink) -- NO se
+  		   * detecta comparando contra el valor anterior, porque el
+  		   * valor pedido puede coincidir con el que ya estaba (ej. los
+  		   * defaults de fábrica, 1000/2000) y un downlink real igual
+  		   * debe mover el servo. */
+  		  static uint16_t objetivoManualServoUs;
+  		  if (modoControlAnterior != 2U) {
+  			  /* Flanco de entrada a este modo -- se queda donde está,
+  			   * no salta a MIN/MAX hasta que llegue un downlink real. */
+  			  objetivoManualServoUs = Servo_GetPulsoActualUs();
+  		  }
+  		  if (CalibFlash_HayObjetivoManualServo()) {
+  			  objetivoManualServoUs = CalibFlash_GetObjetivoManualServoUs();
+  			  CalibFlash_LimpiarObjetivoManualServo();
+  		  }
+  		  Servo_MoverHacia(objetivoManualServoUs);
+  	  } else if (pidActivoAhora) {
+  		  /* Motor operando (en modo 0 normal, o en modo 3 sintonizando
+  		   * el PID -- ver arriba, mismo comportamiento del servo en
+  		   * ambos), y con un SET_RPM por encima del ralentí -- lazo de
+  		   * control real. Setpoint = SET_RPM (downlink directo, uso de
+  		   * prueba hasta que exista la maquina Modo 0/1/2, ver README
+  		   * seccion 4.3), recortado solo contra el techo RPM_MAX (el
+  		   * piso ya lo garantiza controlSolicitado). */
+  		  float setpointRpm = setpointRpmCrudo;
+  		  if (setpointRpm > rpmMax) setpointRpm = rpmMax;
+
+  		  uint16_t salidaPidUs = PID_CalcularSalidaUs(setpointRpm, Tacometro_GetRPMFiltrada());
+  		  Servo_MoverHacia(salidaPidUs);
   	  } else {
-  		  /* Fuera de modo calibración: el servo siempre va (o se queda)
-  		   * en SERVO_PULSO_MIN, la posición segura sin aceleración.
-  		   * Cubre tanto el arranque (por defecto CONTROL_HABILITADO=0)
-  		   * como la salida del modo calibración por el apagado de
-  		   * seguridad de arriba -- en ese caso regresa gradualmente
-  		   * (respetando SERVO_VELOCIDAD_MAX_US_S), no de un salto,
-  		   * sin importar en qué punto del barrido se haya quedado. */
+  		  /* Sin control activo: motor detenido, o motor en su ralentí
+  		   * natural sin SET_RPM comandado por encima de RPM_MIN (Modo
+  		   * 0). El servo siempre va (o se queda) en SERVO_PULSO_MIN, la
+  		   * posición segura sin aceleración. Cubre también la salida
+  		   * del modo calibración por el apagado de seguridad de arriba
+  		   * -- en ese caso regresa gradualmente (respetando
+  		   * SERVO_VELOCIDAD_MAX_US_S), no de un salto, sin importar en
+  		   * qué punto del barrido se haya quedado. */
   		  Servo_MoverHacia(CalibFlash_GetServoPulsoMinUs());
   	  }
+  	  modoControlAnterior = modoControl;
 
     /* USER CODE END WHILE */
 
@@ -891,6 +1177,24 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     /* GPS (SIM7600X) en USART2 -- ver gps.h */
     else if (huart->Instance == USART2) {
         GPS_RxEventCallback(huart, Size);
+    }
+}
+
+/* Sin este callback, un solo error de UART (overrun/framing/ruido --
+ * ej. el USB-a-PC metiendo ruido al plano de tierra, ver hallazgos de
+ * hardware) deja la recepcion por DMA de esa UART muerta para el
+ * resto de la sesion: HAL la aborta internamente al entrar en error y
+ * HAL_UARTEx_RxEventCallback() nunca vuelve a dispararse para ella,
+ * aunque el modulo del otro lado (RAK3172 o GPS) siga funcionando
+ * bien -- todo comando futuro por esa UART solo expira por TIMEOUT sin
+ * que el host jamas vea la respuesta real. Coincide con el sintoma de
+ * campo "dejo de responder y ya no volvio a intentar". */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1) {
+        RAK3172_ErrorCallback(huart);
+    } else if (huart->Instance == USART2) {
+        GPS_ErrorCallback(huart);
     }
 }
 /* USER CODE END 4 */

@@ -100,6 +100,16 @@ void GPS_Update(void);
 void GPS_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size);
 
 /**
+ * Debe llamarse desde el callback global HAL_UART_ErrorCallback() en
+ * main.c, cuando el error provenga de USART2. Mismo motivo que
+ * RAK3172_ErrorCallback(): sin rearmar, un solo error de UART deja la
+ * recepcion de GPS muerta para el resto de la sesion -- el modulo
+ * puede seguir mandando "+CGPSINFO:" perfectamente y el host nunca lo
+ * volveria a ver.
+ */
+void GPS_ErrorCallback(UART_HandleTypeDef *huart);
+
+/**
  * Envía un comando AT crudo al módulo (se agrega "\r\n" internamente),
  * de forma bloqueante -- igual que RAK3172_EnviarComandoAT(), pero acá
  * no hay que esperar una respuesta "OK"/"ERROR" explícita: una vez
@@ -132,6 +142,20 @@ float GPS_GetLongitud(void);
  * fallback (ver LATITUD_FIJA/LONGITUD_FIJA en main.c).
  */
 uint32_t GPS_GetUltimoFixTickMs(void);
+
+/**
+ * Fecha/hora UTC (NO local) del último "+CGPSINFO:" con fix válido,
+ * tal como la reporta el propio receptor GNSS del SIM7600X (campos
+ * "fecha ddmmyy"/"hora hhmmss.s" del formato documentado en
+ * GPS_ProcesarCGPSInfo() -- la parte fraccionaria de los segundos se
+ * descarta). Requiere GPS_TieneFix() == true para ser confiable: si no
+ * hay fix vivo, devuelve false y no toca los punteros de salida.
+ *
+ * @return true si los punteros de salida se llenaron con una fecha/hora
+ *         válida del fix actual.
+ */
+bool GPS_GetFechaHoraUtc(uint16_t *anio, uint8_t *mes, uint8_t *dia,
+                          uint8_t *hora, uint8_t *minuto, uint8_t *segundo);
 
 #ifdef __cplusplus
 }

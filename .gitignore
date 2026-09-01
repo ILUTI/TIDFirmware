@@ -34,6 +34,11 @@ desktop.ini
 # --- Logs de depuracion / diagnostico temporales ---
 *.log
 
+# --- tools/pid_tuning (script de Python) ---
+tools/pid_tuning/venv/
+tools/pid_tuning/__pycache__/
+tools/pid_tuning/*.png
+
 # ============================================================================
 # NOTA: SI se deben subir (no ignorar):
 #   - Core/Src/*.c, Core/Inc/*.h        (todo el codigo fuente)

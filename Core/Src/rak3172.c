@@ -162,6 +162,36 @@ void RAK3172_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     HAL_UARTEx_ReceiveToIdle_DMA(s_huart, s_rxDmaBuffer, RAK3172_RX_BUFFER_SIZE);
 }
 
+void RAK3172_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (s_huart == NULL || huart->Instance != s_huart->Instance) {
+        return;
+    }
+
+    /* ⚠️ DIAGNOSTICO TEMPORAL -- este callback nunca se habia probado
+     * en campo. Imprimir el codigo de error de HAL aca es la unica
+     * forma de confirmar si los "TIMEOUT" repetidos que se ven tras
+     * unos minutos de uplinks son en verdad un error de UART (este
+     * callback SI se dispara, y HAL_ErrorCode dice cual) o si el
+     * modulo/la red se quedan sordos sin que HAL detecte nada aca
+     * (este callback nunca se dispara) -- quitar una vez confirmado. */
+    printf("RAK3172: HAL_UART_ErrorCallback disparado (ErrorCode=0x%08lX) -- rearmando recepcion\r\n",
+           (unsigned long)s_huart->ErrorCode);
+
+    __HAL_UART_CLEAR_OREFLAG(s_huart);
+    __HAL_UART_CLEAR_FEFLAG(s_huart);
+    __HAL_UART_CLEAR_NEFLAG(s_huart);
+    __HAL_UART_CLEAR_PEFLAG(s_huart);
+    volatile uint32_t dummy = s_huart->Instance->RDR;
+    (void)dummy;
+
+    /* Descartar la linea a medio construir -- pudo quedar corrupta o
+     * incompleta por el mismo error que disparo este callback. */
+    s_lineaLen = 0;
+
+    HAL_UARTEx_ReceiveToIdle_DMA(s_huart, s_rxDmaBuffer, RAK3172_RX_BUFFER_SIZE);
+}
+
 void RAK3172_Update(void)
 {
     /* --- 1. Procesar líneas completas encoladas por el callback --- */
@@ -393,6 +423,11 @@ bool RAK3172_EnviarUplinkLive(uint16_t motorIdNumeric, float rpm, float presion,
 
 bool RAK3172_SolicitarHoraRed(void)
 {
+    /* Arranca un ciclo nuevo (sync inicial o resync periodico) --
+     * limpiar el flag del ciclo anterior para que RAK3172_HoraDeRedDisponible()
+     * no reporte "disponible" con el evento viejo antes de que llegue
+     * el +EVT:TIMEREQ_OK de ESTA solicitud. */
+    s_horaDeRedDisponible = false;
     return RAK3172_EnviarComandoAT("AT+TIMEREQ=1");
 }
 
@@ -429,12 +464,13 @@ static void RAK3172_EncolarLinea(const char *linea, uint16_t len)
 
 static void RAK3172_ProcesarLinea(const char *linea)
 {
-    /* Solo se imprimen los eventos "+EVT:" (join, TX_DONE, downlinks
-     * recibidos, etc.) -- no el ruido de "OK"/eco de cada comando AT
-     * enviado, que ya se reporta aparte via RAK3172_GetUltimoResultado(). */
-    if (strncmp(linea, "+EVT:", 5) == 0) {
-        printf("RAK3172 RX crudo: '%s'\r\n", linea);
-    }
+    /* ⚠️ DIAGNOSTICO TEMPORAL (antes solo se imprimian los "+EVT:") --
+     * ahora se imprime TODO lo que llega, igual que ya hace gps.c, para
+     * poder ver si el modulo sigue mandando algo (OK/ERROR/eco/basura)
+     * durante los TIMEOUT repetidos que se ven despues de unos minutos
+     * de uplinks, o si de verdad se queda callado por completo. Volver
+     * a filtrar solo "+EVT:" una vez diagnosticado. */
+    printf("RAK3172 RX crudo: '%s'\r\n", linea);
 
     if (strcmp(linea, "+EVT:JOINED") == 0) {
         s_estaUnido = true;
@@ -465,6 +501,25 @@ static void RAK3172_ProcesarLinea(const char *linea)
 
     if (strncmp(linea, "+EVT:", 5) == 0) {
         RAK3172_ProcesarEventoDownlink(linea);
+        return;
+    }
+
+    if (strcmp(linea, "AT_NO_NETWORK_JOINED") == 0) {
+        /* El modulo perdio su estado de join -- visto en campo justo
+         * despues de que reaparece su banner de arranque
+         * ("RAKwireless RAK3172-E...") en medio de la sesion, es decir
+         * el modulo se reinicio solo (no el STM32) y olvido el join.
+         * s_estaUnido seguia en true porque nada lo desmentia: sin
+         * este chequeo, el reintento periodico de join en main.c
+         * (que solo se dispara si !RAK3172_EstaUnido()) nunca se
+         * activaba, y cada intento de uplink se quedaba pegado los
+         * 2s completos del timeout en vez de fallar al instante. */
+        s_estaUnido = false;
+        if (s_comandoEnCurso) {
+            s_comandoEnCurso = false;
+            s_ultimoResultado = RAK3172_ERROR;
+        }
+        printf("RAK3172: el modulo ya no esta unido a la red (AT_NO_NETWORK_JOINED) -- se reintentara el join\r\n");
         return;
     }
 

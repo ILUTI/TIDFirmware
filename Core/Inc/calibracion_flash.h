@@ -83,11 +83,14 @@ extern "C" {
  * el motor está operando (ver CalibFlash_ProcesarParametroConEstado):
  *   CALIBRACION    -- siempre permitido, incluso operando (SET_RATIO,
  *                      ALPHA -- se necesitan ajustar en caliente para
- *                      calibrar contra un tacómetro externo real).
+ *                      calibrar contra un tacómetro externo real; y
+ *                      PID_KP/KI/KD -- la sintonización en lazo cerrado,
+ *                      README sección 9, exige subir Kp de a poco CON
+ *                      el motor operando, observando la respuesta real).
  *   CONFIGURACION  -- solo permitido con el motor detenido (límites de
- *                      seguridad, ganancias del PID, límites del servo,
- *                      etc.) -- cambiarlos en caliente podría causar un
- *                      comportamiento impredecible del lazo de control.
+ *                      seguridad, límites del servo, etc.) -- cambiarlos
+ *                      en caliente podría causar un comportamiento
+ *                      impredecible del lazo de control.
  *   PROCESO        -- siempre permitido, es su función normal (SET_RPM,
  *                      PRESION llegan constantemente mientras opera).
  *   COMANDO        -- casos especiales (RESTAURAR_DEFAULTS, etc.), se
@@ -199,7 +202,16 @@ uint16_t CalibFlash_GetServoPulsoMinUs(void);
 uint16_t CalibFlash_GetServoPulsoMaxUs(void);
 uint32_t CalibFlash_GetTimeoutSinComandoS(void);
 float    CalibFlash_GetTasaMaxCambioRpmS(void);
-bool     CalibFlash_GetControlHabilitado(void);
+/** 0=desactivado, 1=modo calibración con barrido automático MIN<->MAX,
+ * 2=modo calibración manual (el servo se mantiene quieto salvo que
+ * llegue un downlink nuevo de SERVO_PULSO_MIN/MAX, en cuyo caso se
+ * mueve directo a ese valor), 3=modo sintonización de PID (el servo se
+ * maneja igual que en modo 0 -- PID normal si corresponde -- pero a
+ * diferencia de 1/2 el motor SÍ puede seguir operando sin que se
+ * fuerce de vuelta a 0; único modo en el que PID_KP/PID_KI/PID_KD se
+ * aceptan, y activa el log de alta frecuencia "PID_TEST,..." en
+ * main.c). Ver README sección 4.4/9. */
+uint8_t  CalibFlash_GetControlHabilitado(void);
 uint16_t CalibFlash_GetIntervaloEnvioOperativoS(void);
 uint16_t CalibFlash_GetIntervaloEnvioStandbyS(void);
 CalibFlash_Modo_t CalibFlash_GetModo(void);
@@ -247,7 +259,7 @@ bool CalibFlash_SetServoPulsoMinUs(uint16_t nuevoValor);
 bool CalibFlash_SetServoPulsoMaxUs(uint16_t nuevoValor);
 bool CalibFlash_SetTimeoutSinComandoS(uint32_t nuevoValor);
 bool CalibFlash_SetTasaMaxCambioRpmS(float nuevoValor);
-bool CalibFlash_SetControlHabilitado(bool habilitado);
+bool CalibFlash_SetControlHabilitado(uint8_t modo); /* válido: 0, 1, 2 o 3 -- ver getter */
 bool CalibFlash_SetIntervaloEnvioOperativoS(uint16_t nuevoValor);
 bool CalibFlash_SetIntervaloEnvioStandbyS(uint16_t nuevoValor);
 bool CalibFlash_SetModo(CalibFlash_Modo_t nuevoModo);
@@ -283,6 +295,21 @@ void CalibFlash_LimpiarReporteForzado(void);
  * real (NVIC_SystemReset()).
  */
 bool CalibFlash_HayResetPendiente(void);
+
+/**
+ * Objetivo pendiente para el modo manual de calibración del servo
+ * (CONTROL_HABILITADO=2, ver README 4.4/2.4). Se marca cuando un
+ * downlink de SERVO_PULSO_MIN o SERVO_PULSO_MAX se aplica con éxito
+ * estando en ese modo -- por bandera, no por comparar contra el valor
+ * anterior, para que un downlink que repite el valor ya guardado (ej.
+ * los defaults de fábrica) igual mueva el servo. El loop principal debe
+ * consultar CalibFlash_HayObjetivoManualServo(), y si es true, mover el
+ * servo hacia CalibFlash_GetObjetivoManualServoUs() y llamar
+ * CalibFlash_LimpiarObjetivoManualServo().
+ */
+bool     CalibFlash_HayObjetivoManualServo(void);
+uint16_t CalibFlash_GetObjetivoManualServoUs(void);
+void     CalibFlash_LimpiarObjetivoManualServo(void);
 
 #ifdef __cplusplus
 }

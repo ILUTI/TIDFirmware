@@ -1,10 +1,12 @@
 # TID — Firmware del Nodo Motor Diésel (RIO-DSL)
 
 Firmware para STM32G431KBT6U (Nucleo-32) que mide RPM de un motor diésel
-vía el alternador, se comunica por LoRaWAN (RAK3172), y permite
-calibración/configuración remota mediante un protocolo de parámetros
-propio. Pendiente: control PID del acelerador vía servo, con entrada de
-presión 4-20mA.
+vía el alternador, controla el acelerador con un lazo PID sobre un
+servo, y se comunica por LoRaWAN (RAK3172), con calibración/configuración
+remota mediante un protocolo de parámetros propio. Pendiente: ganancias
+reales del PID (sintonización empírica en campo, ver sección 8), la
+máquina de modos del gobernador (0/1/2), y el sensor de presión de
+entrada 4-20mA.
 
 ---
 
@@ -45,8 +47,10 @@ tacometro.c/h          -> Medicion de RPM (Input Capture + filtro EMA)
 rak3172.c/h             -> Comunicacion con el modulo LoRaWAN + sincronizacion de hora
 calibracion_flash.c/h   -> Persistencia de parametros + dispatcher de downlinks
 servo.c/h               -> Control PWM del servo del acelerador
+pid.c/h                 -> Lazo de control PID de RPM -> pulso del servo
 rtc_reloj.c/h           -> Reloj interno (RTC sobre LSI) + conversion epoch<->calendario
 gps.c/h                 -> Posicion GPS/GNSS (SIM7600X) + disciplina del RTC
+comando_serial.c/h      -> Mando manual TEMPORAL por serial (sustituto de LoRa en banco)
 main.c                  -> Orquestacion general
 ```
 
@@ -119,40 +123,153 @@ recepción en cada `RAK3172_Init()`.
 | 2 | Downlink de parámetro (ver protocolo abajo) |
 | 3 | Application ACK |
 
-**Estado LoRaWAN**: Clase C, join OTAA con `AutoJoin=1` (persistente).
-⚠️ El RAK3172 **no cambia de clase automáticamente** solo porque el
-Device Profile en el servidor diga "admite Clase C" — hay que mandarle
-explícitamente `AT+CLASS=C` (default de fábrica es Clase A).
+**Estado LoRaWAN**: Clase C, join OTAA. ⚠️ El RAK3172 **no cambia de
+clase automáticamente** solo porque el Device Profile en el servidor
+diga "admite Clase C" — hay que mandarle explícitamente `AT+CLASS=C`
+(default de fábrica es Clase A).
 
-#### Sincronización de hora (GPS + DeviceTimeReq)
+⚠️ **`AutoJoin` en `0`, no `1`, como prueba temporal en curso**
+(`RAK3172_Join()` manda `AT+JOIN=1:0:10:8`): se cambió para aislar si
+ese parámetro específico causaba el `AT_ERROR` de join visto en campo.
+La causa real resultó ser el bug de sub-banda de abajo (`AT+MASK`), ya
+resuelto — falta decidir si `AutoJoin` vuelve a `1` en producción
+(reintento automático interno del propio módulo tras un power-cycle,
+sin que el host tenga que pedir el join de nuevo) o si conviene dejarlo
+en `0` y manejar todos los reintentos desde el host, como ya se hace
+ahora (ver más abajo). Ver pendientes, sección 8.
 
-Desde que se integró el GPS (ver 2.6), la hora real (unix epoch) tiene
-**dos fuentes independientes**, ambas llaman a `Reloj_SetHoraUtc()`:
+#### Orden de arranque, join, y recuperación ante caídas — LoRa como prioridad
 
-1. **GPS** (`gps.c`, más rápida): cada `+CGPSINFO:` con fix trae fecha
-   y hora UTC — se aplica al RTC en cada reporte (cada 10s), lo que de
-   paso disciplina continuamente el LSI (impreciso, deriva con
-   temperatura) contra una fuente precisa.
-2. **Red LoRaWAN** (`DeviceTimeReq`, respaldo): si el GPS nunca
-   consigue fix (sin vista al cielo), este mecanismo sigue funcionando
-   igual que siempre. Como está protegido por
-   `!Reloj_EstaSincronizado()`, si el GPS ya sincronizó primero, este
-   bloque simplemente no hace nada — no hay conflicto entre las dos
-   fuentes.
+Requisito explícito del proyecto: **el join LoRaWAN debe intentarse
+antes que cualquier otra cosa en el arranque**, y el nodo debe
+reconectarse solo si pierde el join en cualquier momento, sin necesidad
+de un reinicio manual del STM32. Así quedó implementado en `main.c` y
+`rak3172.c`:
 
-El flujo completo de `DeviceTimeReq` (RUI3: `AT+TIMEREQ`/`AT+LTIME`):
+**1. Arranque — LoRa antes que el GPS.** `RAK3172_Init()` corre
+inmediatamente después de `Tacometro_Init()`, seguido de `AT+MASK=0002`
+(fix de sub-banda, ver 2.2 más abajo) y `RAK3172_Join()` — **todo esto
+antes de `GPS_Init()`**. Antes, el GPS se inicializaba primero y sus
+~2.5s de `HAL_Delay()` bloqueantes retrasaban el primer intento de join
+sin necesidad; ahora el join sale lo antes posible y el GPS se
+inicializa después, sin competir por tiempo de arranque.
 
-1. Una vez unido (`RAK3172_EstaUnido()`), se manda `AT+TIMEREQ=1`
-   (`RAK3172_SolicitarHoraRed()`).
-2. La hora **no llega de inmediato** — viaja "montada" en el próximo
-   uplink exitoso. Cuando eso pasa, el módulo emite el evento
-   `+EVT:TIMEREQ`, detectado en `RAK3172_ProcesarLinea()` y expuesto
-   como `RAK3172_HoraDeRedDisponible()`.
+**2. El propio módulo reintenta el join solo, 8 veces cada 10s**
+(`AT+JOIN=1:0:10:8`, sin que el host tenga que hacer nada) antes de
+declarar la primera ronda fallida. Un evento
+**`+EVT:JOIN_FAILED_RX_TIMEOUT`** aislado es normal (una ventana de
+recepción perdida) — no es una falla del sistema mientras algún
+intento de esos 8 termine en `+EVT:JOINED`, que es justo lo que se ve
+en campo la mayoría de las veces.
+
+**3. Confirmación**: `+EVT:JOINED` pone `RAK3172_EstaUnido()` en
+`true`. A partir de ahí se habilita el envío periódico del uplink LIVE
+(cada 30s) y la solicitud de hora por red (ver sincronización de hora
+más abajo).
+
+**4. Detección de caída a mitad de sesión (agregado 2026-08-29, tras un
+caso real en campo).** El primer diseño no tenía ninguna forma de
+notarlo: `RAK3172_EstaUnido()` solo se ponía en `false` cuando el
+propio host llamaba a `RAK3172_Join()`, así que si el módulo perdía el
+join por su cuenta (ej. un reinicio espontáneo — ver hallazgo de
+hardware abajo), el firmware seguía creyendo que todo estaba bien para
+siempre, mandando uplinks al vacío sin parar. Ahora `rak3172.c`
+reconoce la respuesta **`AT_NO_NETWORK_JOINED`** (la que da el módulo
+cuando se le pide enviar sin estar unido) como prueba definitiva de que
+ya no hay join, y de inmediato (sin esperar los 2s del timeout) pone
+`RAK3172_EstaUnido()` en `false` y lo reporta por log.
+
+**5. Reintento automático, sin bloquear el resto del loop.** Con
+`RAK3172_EstaUnido()` en `false`, el loop principal dispara una máquina
+de 2 pasos no bloqueante: reafirma `AT+MASK=0002` (por si ese comando
+había fallado silenciosamente en el arranque original) y, en cuanto
+responde, manda `AT+JOIN` de nuevo. Si no se logra unir, este ciclo se
+repite cada `INTERVALO_REINTENTO_JOIN_MS` (2 minutos, con margen sobre
+los ~80s que tarda el módulo en agotar sus propios 8 intentos) de forma
+indefinida, hasta que el join se recupere. Antes de este cambio, un
+fallo de join al arrancar (o una caída a mitad de sesión) dejaba al
+nodo sin LoRa **para siempre**, sin ningún reintento — este era
+justamente el reporte original que motivó todo este trabajo.
+
+**6. Recuperación de errores de UART (`HAL_UART_ErrorCallback`).**
+Aparte de la lógica de arriba, se encontró que un solo error de UART
+(overrun/framing/ruido — ej. el ruido del cable USB-a-PC ya documentado
+en 2.6) dejaba la recepción por DMA de USART1 o USART2 muerta para el
+resto de la sesión: HAL aborta la recepción internamente al entrar en
+error, y sin un `HAL_UART_ErrorCallback()` que la rearme, el callback
+normal de datos nunca vuelve a dispararse — todo comando futuro por esa
+UART expira por `TIMEOUT` sin que el host jamás vea la respuesta real,
+aunque el módulo del otro lado siga funcionando bien. Se agregaron
+`RAK3172_ErrorCallback()`/`GPS_ErrorCallback()` (limpian los flags de
+error y rearman la recepción) y un `HAL_UART_ErrorCallback()` en
+`main.c` que las despacha según la instancia — mismo patrón que
+`HAL_UARTEx_RxEventCallback()`. ⚠️ Actualmente instrumentado con prints
+de diagnóstico temporal (`DIAGNOSTICO TEMPORAL` en el código) para
+confirmar en campo si este camino llega a dispararse; quitar una vez
+confirmado.
+
+**7. Logging de resultados AT: por flanco, no por cambio de valor.**
+El reporte `RAK3172: resultado=...` del loop principal originalmente
+solo se imprimía cuando el resultado **cambiaba** respecto al último
+mostrado. Eso ocultaba fallos reales: si un comando fallaba con
+`TIMEOUT` dos veces seguidas, la segunda vez no se imprimía nada (mismo
+valor que la anterior), y en el log parecía que el nodo "dejó de
+intentar" cuando en realidad seguía intentando y fallando cada vez
+igual. Corregido para detectar el **flanco** de "comando recién
+terminado" (en curso → listo), que reporta cada finalización real sin
+importar si el resultado se repite.
+
+⚠️ **Caso de campo abierto (2026-08-29): reinicios espontáneos del
+RAK3172.** Se observó el módulo reiniciándose solo repetidamente
+(reaparece su banner de arranque `RAKwireless RAK3172-E...` en medio de
+la sesión, cada 10-30s en el peor caso, formando un ciclo de reinicios)
+— la lógica de los puntos 4-5 de arriba maneja esto correctamente
+(detecta la caída y reintenta sin quedarse trabado), pero la causa raíz
+de por qué el módulo se reinicia **no es de software**: se sospecha de
+la conexión de la antena o de la alimentación (picos de corriente de
+TX de LoRa hundiendo el rail de alimentación — ver hallazgos de
+hardware de este proyecto sobre márgenes ajustados de energía). En
+investigación, ver pendientes (sección 8).
+
+#### Sincronización de hora: GPS (primaria) + LoRaWAN DeviceTimeReq (respaldo)
+
+El RTC corre del LSI interno (ver 2.5), sin cristal LSE — deriva
+**medida en campo (2026-08-26): ~0.84%** (equivale a ~12 min/día sin
+corrección). Por eso la hora no se sincroniza una sola vez al
+arrancar, sino que se resincroniza durante toda la operación contra
+**dos fuentes redundantes**, ambas llamando a `Reloj_SetHoraUtc()`:
+
+1. **GPS** (`GPS_GetFechaHoraUtc()`, primaria): `main.c` la consulta
+   cada `INTERVALO_RESYNC_GPS_MS` (30s, igual al envío de RPM) si hay
+   fix vivo (`GPS_TieneFix()`). No compite por el canal AT del
+   RAK3172 ni gasta duty cycle — el único límite real es que el propio
+   SIM7600X solo refresca su reporte `+CGPSINFO:` cada 10s (ver 2.6),
+   así que preguntar más seguido no trae dato más fresco.
+2. **Red LoRaWAN** (`DeviceTimeReq`, respaldo): antes del primer sync
+   (de cualquier fuente) compite libremente con el GPS — el que llegue
+   primero gana. Una vez que ya hubo un sync exitoso, se limita a
+   activarse solo si pasan `INTERVALO_FALLBACK_LORA_MS` (30 min) sin
+   ningún resync nuevo — típicamente porque el GPS no tiene vista al
+   cielo por un rato largo. Ver `necesitaFallbackLora` en `main.c`.
+
+El flujo del `DeviceTimeReq` en sí (RUI3: `AT+TIMEREQ`/`AT+LTIME`) no
+cambia:
+
+1. `RAK3172_SolicitarHoraRed()` manda `AT+TIMEREQ=1` — a diferencia
+   del diseño original, se puede (y se debe) llamar repetidas veces,
+   no solo una vez por arranque; cada llamada limpia internamente el
+   flag del ciclo anterior (`RAK3172_HoraDeRedDisponible()`) para no
+   confundirlo con el evento de un ciclo previo.
+2. La hora **no llega de inmediato** — viaja "montada" como MAC
+   command en el `FOpts` del próximo uplink exitoso (no es un uplink
+   dedicado, sin costo de duty cycle extra). Cuando eso pasa, el
+   módulo emite el evento **`+EVT:TIMEREQ_OK`**, detectado en
+   `RAK3172_ProcesarLinea()` y expuesto como
+   `RAK3172_HoraDeRedDisponible()`.
 3. Con la hora ya disponible, se consulta el valor con `AT+LTIME=?`
    (`RAK3172_ConsultarHoraRed()`), y la respuesta se lee por el
    mecanismo genérico `RAK3172_GetUltimaRespuesta()`.
-4. `main.c` parsea esa respuesta como epoch UTC y llama a
-   `Reloj_SetUnixTimeUtc()` (ver sección 2.5).
+4. `main.c` parsea esa respuesta y llama a `Reloj_SetHoraUtc()`.
 
 Formato de `AT+LTIME=?` **confirmado en campo** (2026-08-17): texto
 legible, no un epoch plano —
@@ -168,14 +285,26 @@ el ciclo circular "sin uplink no hay hora, sin hora no hay uplink" —
 ver `CalibFlash_GetUltimaHoraUtcConocida()`/`Reloj_CargarHoraAproximada()`
 en 2.5.
 
-**Cuidado con el reset del contador de estado al sincronizar** (bug
-corregido 2026-08-18): cuando el reloj salta de un valor
-aproximado/placeholder al real (por GPS o por red), el código en
-`main.c` **desplaza** el ancla de `inicio_operacion`
-(`inicioEstadoLocal`) por el mismo salto, en vez de reiniciarla a
-"ahora" — si no, cada sincronización borraba el tiempo ya transcurrido
-en el estado actual (`estado` sin cambiar), aunque el motor llevara
-horas en el mismo estado.
+**Preservación del contador de estado al (re)sincronizar** (bug
+corregido 2026-08-18, generalizado a todo resync 2026-08-26): cada vez
+que el reloj se corrige — el primer sync desde el placeholder de
+flash, o cualquier resync periódico posterior, por GPS o por red — el
+código en `main.c` **desplaza** el ancla de `inicio_operacion`
+(`inicioEstadoLocal`) por el mismo salto (bandera
+`relojFueCorregidoEsteCiclo`), en vez de reiniciarla a "ahora". Si no,
+cada corrección (incluido un resync rutinario cada 30s por GPS)
+borraría el tiempo ya transcurrido en el estado actual, aunque el
+motor llevara horas sin cambiar de estado.
+
+⚠️ **No confundir latencia de pipeline con imprecisión del RTC**
+(observado en campo, 2026-08-26): comparar `fecha_hora` del payload
+(la pone el dispositivo al armar el uplink) contra la marca de tiempo
+de recepción en AWS/MQTT casi siempre muestra un desfase de varios
+segundos — eso es el tiempo real que tarda el mensaje en viajar
+LoRaWAN → gateway → network server → Lambda decoder → MQTT, **no**
+error del reloj. La señal de que sí es el RTC es que ese desfase
+**crezca** con el tiempo entre mensajes sucesivos; si se mantiene
+plano (aunque no sea exactamente 0s), el reloj está bien.
 
 ### 2.3 `calibracion_flash.c/h`
 
@@ -201,7 +330,7 @@ se puede cambiar con el motor operando:
 
 | Categoría | Se permite con el motor operando | Parámetros |
 |---|---|---|
-| CALIBRACION | Sí, siempre | `SET_RATIO`, `ALPHA` |
+| CALIBRACION | Sí, siempre | `SET_RATIO`, `ALPHA`, `PID_KP`, `PID_KI`, `PID_KD` |
 | PROCESO | Sí, siempre (es su función) | `SET_RPM`, `PRESION` |
 | COMANDO | Evaluado aparte | `FORZAR_REPORTE`, `RESTAURAR_DEFAULTS`, `RESET_REMOTO` |
 | CONFIGURACION | **No** — se rechaza | Todos los demás (default conservador) |
@@ -229,26 +358,108 @@ llamadas, así que no depende de la cadencia exacta del loop principal.
 `SERVO_PULSO_MIN` y `SERVO_PULSO_MAX` (vía `Servo_MoverHacia()`) — para
 observar en banco el recorrido físico real mientras se ajustan esos
 dos límites por downlink, con efecto inmediato en el barrido en curso
-(se leen en cada vuelta del loop, no se cachean). Es también el único
+(se leen en cada vuelta del loop, no se cachean). Al llegar a cada
+extremo se hace una pausa de `SERVO_BARRIDO_PAUSA_EXTREMOS_MS` (1000ms,
+`servo.h` — fija, no configurable por downlink; ajustar y reflashear si
+hace falta) antes de invertir la dirección — el pulso PWM comandado
+llega exacto al límite en cuanto se cumple `SERVO_VELOCIDAD_MAX_US_S`,
+pero el servo físico tiene su propio tiempo de asentamiento; sin esa
+pausa, el firmware invertía la marcha en la misma vuelta del loop en
+que el pulso llegaba al extremo, y el brazo real nunca alcanzaba a
+terminar de llegar al tope mecánico antes de que se le pidiera ir al
+otro lado (los modos `0`/`2` no tienen este problema porque el destino
+se queda fijo indefinidamente, dándole tiempo de sobra al servo).
+`CONTROL_HABILITADO=2`
+es el modo manual: el servo se queda quieto en su posición actual (no
+salta a ningún límite al entrar) y solo se mueve cuando llega un
+downlink de `SERVO_PULSO_MIN` o `SERVO_PULSO_MAX`, yendo directo a ese
+valor — útil para verificar un punto exacto del recorrido sin esperar
+una vuelta completa del barrido. El "llegó un downlink" se marca con
+una bandera en el instante en que `calibracion_flash.c` aplica el
+parámetro con éxito
+(`CalibFlash_HayObjetivoManualServo()`/`GetObjetivoManualServoUs()`/
+`LimpiarObjetivoManualServo()`), **no** comparando contra el valor
+anterior — si se comparara, un downlink que repite el valor ya guardado
+(ej. los defaults de fábrica, `SERVO_PULSO_MIN=1000`/`MAX=2000`) nunca
+se vería como "cambio" y el servo no se movería, aunque el downlink sí
+haya llegado. Ambos (`1` y `2`) son el único
 momento en que `SERVO_PULSO_MIN/MAX` se pueden cambiar (fuera de modo
 calibración, se rechazan con `APPLY_ERROR` aunque el motor esté
 apagado). Medida de seguridad: si el motor arranca mientras
-`CONTROL_HABILITADO=1`, el firmware lo fuerza a `0` localmente en el
-mismo ciclo (vía `Tacometro_EstaDetenido()`), sin esperar ningún
-downlink — nunca se deja el barrido corriendo con el motor operando.
-Este bloque de barrido es temporal, pensado para desaparecer cuando
-exista el PID real (que llamará `Servo_MoverHacia()` con su propia
-salida en vez de este barrido fijo).
+`CONTROL_HABILITADO` es `1` o `2`, el firmware lo fuerza a `0`
+localmente en el mismo ciclo (vía `Tacometro_EstaDetenido()`), sin
+esperar ningún downlink — nunca se deja el servo bajo control remoto de
+calibración con el motor operando.
+
+**Log `SERVO_CAL`**: mientras `CONTROL_HABILITADO` sea `1` o `2`, cada
+1s se imprime `SERVO_CAL,min=<us>,max=<us>,pulso_actual=<us>` — antes
+de esto, la única forma de ver los límites vigentes en banco era el ACK
+de cada downlink de `SERVO_PULSO_MIN/MAX` (`valor vigente=X`); esta
+línea muestra en vivo, mientras se observa el servo moverse, dónde
+están los límites configurados y qué pulso se le está aplicando en ese
+instante. Fuera de esos dos modos no imprime nada (a diferencia de
+`PID_TEST`, sección 9, esto es solo para lectura humana en banco, no
+pensado para analizarse después con un script).
+
+Este bloque de barrido queda como el mecanismo permanente para
+recalibrar `SERVO_PULSO_MIN/MAX` en banco (ej. si se cambia de servo o
+de geometría de la varilla) — no se retira al existir el PID real
+(`pid.c/h`, ver abajo), simplemente son mutuamente excluyentes: uno
+corre en `CONTROL_HABILITADO=1`, el otro con el motor operando y
+`CONTROL_HABILITADO=0` (ver 4.4).
 
 **Posición segura = `SERVO_PULSO_MIN`** (confirmado en el montaje
 físico real: ese extremo deja el acelerador sin aceleración/ralentí,
-no es un valor arbitrario). Mientras `CONTROL_HABILITADO=0` (arranque,
-o justo después del apagado de seguridad de arriba), el servo siempre
-va o se mantiene ahí — al arrancar se manda de una vez (no se conoce
-la posición previa, quedó como estuviera al perder alimentación); al
-salir del barrido por el apagado de seguridad, regresa gradualmente
-vía `Servo_MoverHacia()` (respetando `SERVO_VELOCIDAD_MAX_US_S`, no de
-un salto), sin importar en qué punto del recorrido se haya quedado.
+no es un valor arbitrario). Con `CONTROL_HABILITADO=0` y el motor
+detenido (arranque, o justo después del apagado de seguridad de
+arriba), el servo siempre va o se mantiene ahí — al arrancar se manda
+de una vez (no se conoce la posición previa, quedó como estuviera al
+perder alimentación); al salir del barrido por el apagado de
+seguridad, regresa gradualmente vía `Servo_MoverHacia()` (respetando
+`SERVO_VELOCIDAD_MAX_US_S`, no de un salto), sin importar en qué punto
+del recorrido se haya quedado. Si en cambio el motor está operando
+(y no se está calibrando), el servo lo maneja el PID (ver abajo), no
+esta posición fija.
+
+**PID (`pid.c/h`)**: lazo de control real, activo en `main.c` solo
+cuando el motor opera, `CONTROL_HABILITADO=0` o `=3` (no se está
+calibrando el servo -- `=3` es la sesión de sintonización del PID en
+sí, ver 4.4, y el servo se comporta exactamente igual que en `=0`)
+**y** se comandó explícitamente un `SET_RPM` por encima de `RPM_MIN`
+— mutuamente excluyente con el barrido de banco por diseño (ver 4.4).
+`PID_CalcularSalidaUs(setpointRpm, rpmMedida)` devuelve el pulso en µs
+directos que se le pasa a `Servo_MoverHacia()`, usando
+`SERVO_PULSO_MIN` como línea base (la corrección del PID se suma sobre
+ella, no la reemplaza) y recortando contra `SERVO_PULSO_MIN/MAX`.
+Anti-windup por integración condicional (la integral se congela si ya
+está saturando en la misma dirección del error) y se resetea sola
+mientras `PID_KI=0`, para que no acumule en silencio y aparezca de
+golpe cuando se active esa ganancia. `PID_Init()` se llama una sola vez
+en el flanco de entrada a este modo, para que el primer cálculo no use
+un `dt` inflado por el tiempo inactivo.
+
+**`RPM_MIN` es el umbral de "¿debe intervenir el control?", no solo un
+límite duro** — `RPM_MIN` ya está documentado como "límite duro /
+ralentí" (tabla de parámetros), y el ralentí real es distinto en cada
+motor. Modo 0 (ralentí: el motor sube solo de 0Hz a su ralentí natural,
+sección 4.3) es deliberadamente **sin control**: con `SET_RPM` en su
+default sin comandar (`0`, no persiste en flash, ver
+`CalibFlash_Init()`) o en cualquier valor por debajo de `RPM_MIN`, el
+PID no corre y el servo se queda en `SERVO_PULSO_MIN` — nunca se
+recorta `SET_RPM` hacia arriba hasta `RPM_MIN` como si fuera un
+setpoint válido. El lazo solo se activa cuando `SET_RPM > RPM_MIN`
+(equivale en la práctica a pedir "Modo 1" antes de que exista la
+máquina Modo 0/1/2 real); una vez activo, el setpoint sí se recorta
+hacia abajo contra `RPM_MAX` si se pide algo más alto.
+
+El setpoint hoy es `SET_RPM` (downlink directo) — uso de prueba hasta
+que exista la máquina Modo 0/1/2 (sección 4.3), que decidirá el
+setpoint real según la presión sin que este módulo tenga que cambiar.
+Ganancias (`PID_KP/KI/KD`) siguen en sus defaults (`Kp=1.0, Ki=0,
+Kd=0`) a la espera de sintonización con el motor real (Ziegler-Nichols
+en lazo cerrado, ver sección 9; solo se pueden tocar en
+`CONTROL_HABILITADO=3`) — suficientes para validar que el lazo mueve
+el servo en la dirección correcta, no para un control ya afinado.
 
 **Alimentación del servo**: fuente externa 5-6V, GND común con el
 G431, señal PWM a 3.3V (compatible con la mayoría de servos de RC sin
@@ -263,9 +474,12 @@ poblado** en este Nucleo-32, ni pila de respaldo (VBAT) dedicada.
 
 **Consecuencia práctica**: la hora se pierde en cada corte real de
 energía (no en un `NVIC_SystemReset()` mientras VDD no se interrumpa)
-— por eso el firmware **resincroniza contra la red LoRaWAN
-(DeviceTimeReq) en cada arranque** (ver sección 2.2), en vez de asumir
-que el RTC "recuerda" la hora entre encendidos.
+— por eso el firmware **busca resincronizarse (por GPS o por red
+LoRaWAN, ver 2.2) en cada arranque**, en vez de asumir que el RTC
+"recuerda" la hora entre encendidos. Además, al no tener cristal LSE,
+el LSI deriva con el tiempo (**~0.84% medido en campo**, ver 2.2) — por
+eso la resincronización tampoco es única al arrancar, sino periódica
+durante toda la operación.
 
 - El RTC guarda la hora en **UTC** (la misma que entrega
   `DeviceTimeReq`) — el offset de **-6h de Guatemala se aplica solo al
@@ -310,13 +524,57 @@ Formato de `+CGPSINFO:` (sin checksum, a diferencia de NMEA):
 Sin fix, todos los campos vienen vacíos: `+CGPSINFO: ,,,,,,,,`.
 
 **Secuencia de inicio** (`main.c`): `GPS_Init(&huart2)` arranca la
-recepción, luego `AT+CGPS=1` (enciende el motor GNSS; responde `ERROR`
-—inofensivo— si el módulo ya estaba encendido de una sesión previa),
-una pausa de **1.5s** (⚠️ necesaria, confirmada en campo: sin ella, tras
-el `ERROR` el módulo dejaba de contestar absolutamente nada, ni
-siquiera el eco del siguiente comando — parece necesitar ese instante
-para estabilizarse tras esa respuesta), y por último
-`AT+CGPSINFO=10` (habilita el auto-reporte cada 10s).
+recepción, una pausa de 500ms, `AT+CGPS=1` (enciende el motor GNSS;
+responde `ERROR` —inofensivo— si el módulo ya estaba encendido de una
+sesión previa), una pausa de 1.5s, y por último `AT+CGPSINFO=10`
+(habilita el auto-reporte cada 10s). Simple, sin lógica adicional —
+el bug de abajo **no era esto**.
+
+✅ **RESUELTO (2026-08-25) — causa raíz real: el cable USB del Nucleo
+a la PC, no el firmware.** El GPS nunca daba fix tras un arranque en
+frío real **mientras el cable USB del Nucleo a la computadora estaba
+conectado** (el mismo que se usa para ver el monitor serie de debug).
+Confirmado con una prueba A/B limpia, mismo hardware, un solo cable
+como única variable: con el USB del Nucleo conectado a la PC, el GPS
+se queda en `+CGPSINFO: ,,,,,,,,,` (vacío) indefinidamente; al
+desconectarlo, engancha fix casi de inmediato. Reproducido de forma
+consistente. Hipótesis del mecanismo: con el Nucleo alimentado por
+batería **y** por USB al mismo tiempo, las dos tierras (batería/PC)
+meten ruido eléctrico al plano de tierra compartido — un UART digital
+lo tolera sin problema (por eso los comandos AT siempre respondían
+bien), pero el front-end de RF del receptor GNSS, tratando de
+detectar señales de satélite muy débiles, es mucho más sensible a ese
+ruido.
+
+**Implicación importante**: en campo, el Nucleo va a estar alimentado
+solo por batería, sin ninguna laptop conectada por USB — es probable
+que este bug **nunca ocurra en operación real**, solo se manifestaba
+por estar viendo el log de depuración en el banco mientras el sistema
+corría con alimentación externa simultánea. Pendiente de una
+confirmación final: un ciclo de encendido con USB desconectado desde
+el principio (no solo reconectado después) para verificar que el GPS
+ya tiene fix cuando finalmente se conecta el monitor.
+
+**Vías investigadas y descartadas antes de encontrar la causa real**
+(no volver a intentarlas sin evidencia nueva — todas con evidencia
+real de campo):
+- Timing de `AT+CGPS=1`/`AT+CGPSINFO=10` (delays de 0.5s a 10s, espera
+  event-driven del `'RDY'`) — el comando siempre llegaba y se
+  ejecutaba bien; probado también con delay largo y corto vía USB-TTL
+  aislado, ambos funcionaron — no era timing.
+- `AT+CGPSCOLD` (cold start explícito) en vez de `AT+CGPS=1` — devolvió
+  `ERROR`, no soportado en esta versión de firmware del módulo.
+- Interferencia RF del RAK3172 (LoRaWAN transmitiendo durante la
+  adquisición GNSS) — descartado con el RAK3172 desconectado de
+  energía, el GPS seguía sin dar fix mientras el USB del Nucleo
+  estuviera conectado.
+- Capacitor electrolítico local en los pines de alimentación del
+  módulo GPS — probado, no cambió nada.
+- Regulador compartido con el servo — descartado, ya están en ramas
+  separadas.
+- "El STM32 no reflashea bien" — descartado: un simple reset por botón
+  (sin cargar código nuevo) ya funcionaba, así que nunca fue cuestión
+  de código nuevo.
 
 **Prioridad de posición para el uplink LIVE** (`main.c`): GPS con fix
 vivo (`GPS_TieneFix()`) → última posición conocida persistida en flash
@@ -326,8 +584,11 @@ reporte, para no desgastar la flash) → `LATITUD_FIJA`/`LONGITUD_FIJA`
 como último respaldo si el GPS nunca ha conseguido fix (ni en este
 arranque ni en ninguno anterior).
 
-**Disciplina del RTC**: cada `+CGPSINFO:` con fix también llama a
-`Reloj_SetHoraUtc()` con la fecha/hora UTC del GPS — ver sección 2.2.
+**Disciplina del RTC**: `GPS_GetFechaHoraUtc()` expone la fecha/hora
+UTC del último `+CGPSINFO:` con fix (campos `fecha ddmmyy`/`hora
+hhmmss.s` del formato de arriba — antes descartados, solo se usaba
+lat/lon). Es la fuente **primaria** de sincronización del RTC, con la
+red LoRaWAN como respaldo — ver sección 2.2 para el mecanismo completo.
 
 **⚠️ Hallazgos de hardware del Waveshare SIM7600X-H 4G HAT** (ninguno
 obvio desde el firmware, costaron varias horas de campo):
@@ -359,6 +620,44 @@ buffer` en vez de `0` en ese caso) — congelaba el `while(1)` completo
 del `main()` (incluida la impresión de `Frecuencia`), no solo al GPS.
 Corregido acotando `Size` a `0` cuando llega igual al tamaño del
 buffer.
+
+**Reintento automático tras reportes vacíos seguidos**: si llegan
+`GPS_REPORTES_VACIOS_ANTES_DE_REENVIAR` (10, `gps.h`) reportes
+`+CGPSINFO: ,,,,,,,,` **seguidos** (~100s sin fix a razón de uno cada
+10s), `GPS_ProcesarCGPSInfo()` reenvía `AT+CGPS=1` por su cuenta y
+reinicia el contador. Es una red de seguridad barata, no una solución
+al bug de arriba (ese ya se resolvió y no era del módulo) — si el GPS
+está sano y solo tarda en conseguir fix (mal clima, sin vista al
+cielo), el reenvío es inofensivo: con el GPS ya encendido, `AT+CGPS=1`
+solo contesta `ERROR` sin interrumpir la adquisición en curso. El
+contador se reinicia también en cuanto llega un fix real.
+
+### 2.7 `comando_serial.c/h` — mando manual TEMPORAL por serial
+
+Mientras no hay red LoRa disponible en campo para probar downlinks
+reales, este módulo permite escribir a mano un "downlink" por el mismo
+puerto de debug (LPUART1) que ya se usa para ver los logs. Sondea la
+bandera RXNE del UART sin bloquear (sin IT/DMA — un operador tipeando
+nunca lo satura), arma la línea con eco local, y al recibir Enter la
+pasa por `CalibFlash_ProcesarParametroConEstado()` — **el mismo punto
+de entrada que usa `rak3172.c` para un downlink real** (misma
+validación de rango, mismo bloqueo por categoría con el motor
+operando, misma persistencia en flash). La única diferencia real es el
+transporte: no manda el Application ACK por LoRaWAN
+(`RAK3172_EnviarAck`), el resultado se imprime directo al mismo
+puerto, como si fuera el ACK.
+
+Formato de línea: `NOMBRE_PARAMETRO [VALOR]`, con el mismo nombre y el
+mismo valor "humano" (sin escalar) que se manda por MQTT vía
+`RIO-DSL-SendDownlink` (ver sección 6) — ej. `CONTROL_HABILITADO 1`,
+`SET_RPM 900`, `SERVO_PULSO_MIN 1050`. Los comandos
+(`RESTAURAR_DEFAULTS`, `FORZAR_REPORTE`, `RESET_REMOTO`) no llevan
+VALOR, el módulo manda el byte de confirmación `0xA5` automáticamente.
+
+Este módulo es un mando temporal — quitar su llamada en `main.c`
+(`ComandoSerial_Init()`/`ComandoSerial_Update()`) cuando exista un
+mando local real (pantalla/botonera) o ya no se necesite probar sin
+red LoRa.
 
 ### Formato del downlink (FPort 2)
 
@@ -395,14 +694,14 @@ downlink fue rechazado, es el valor anterior, no el solicitado.
 | 3 | `SET_RPM` | x10 | 2B uint16 | Proceso | Setpoint directo (uso interno/pruebas, MODO=0) |
 | 4 | `RPM_MAX` | x10 | 2B uint16 | Configuración | Límite duro superior |
 | 5 | `RPM_MIN` | x10 | 2B uint16 | Configuración | Límite duro / ralentí |
-| 6 | `PID_KP` | x100 | 2B int16 | Configuración | Con signo |
-| 7 | `PID_KI` | x1000 | 2B int16 | Configuración | Con signo |
-| 8 | `PID_KD` | x1000 | 2B int16 | Configuración | Con signo |
-| 9 | `SERVO_PULSO_MIN` | directo (µs) | 2B uint16 | Configuración | Límite mecánico. Además requiere `CONTROL_HABILITADO=1` (modo calibración) — si no, `APPLY_ERROR` aunque el motor esté apagado |
+| 6 | `PID_KP` | x100 | 2B int16 | Calibración | Con signo. Solo se acepta con `CONTROL_HABILITADO=3` (modo sintonización PID) — `APPLY_ERROR` en cualquier otro modo, incluida la operación normal (`=0`). Se permite con el motor operando (necesario para sintonizar en lazo cerrado, ver sección 9) |
+| 7 | `PID_KI` | x1000 | 2B int16 | Calibración | Con signo. Igual que `PID_KP` |
+| 8 | `PID_KD` | x1000 | 2B int16 | Calibración | Con signo. Igual que `PID_KP` |
+| 9 | `SERVO_PULSO_MIN` | directo (µs) | 2B uint16 | Configuración | Límite mecánico. Además requiere `CONTROL_HABILITADO=1` o `=2` (modo calibración del servo, NO `=3`) — si no, `APPLY_ERROR` aunque el motor esté apagado |
 | 10 | `SERVO_PULSO_MAX` | directo (µs) | 2B uint16 | Configuración | Igual que `SERVO_PULSO_MIN` |
 | 11 | `TIMEOUT_SIN_COMANDO_S` | directo (s) | 2B uint16 | Configuración | 60-3600s |
 | 12 | `TASA_MAX_CAMBIO_RPM_S` | x10 | 2B uint16 | Configuración | Rampa normal |
-| 13 | `CONTROL_HABILITADO` | flag | 1B | Configuración | Enable/disable lazo de control. **Modo calibración de servo** mientras no exista el PID: en `1`, corre el barrido de banco entre `SERVO_PULSO_MIN/MAX` (con el motor ya apagado, por la regla general de categoría Configuración) y habilita cambiar esos dos parámetros; el firmware lo fuerza a `0` localmente en el instante que el motor arranca, sin esperar downlink |
+| 13 | `CONTROL_HABILITADO` | 0/1/2/3 | 1B | Configuración | Enable/disable lazo de control + **modos de calibración** (con el motor ya apagado, por la regla general de categoría Configuración, para entrar a `1`/`2`/`3`): `0` desactivado (lazo PID normal si aplica), `1` barrido automático continuo entre `SERVO_PULSO_MIN/MAX`, `2` manual -- el servo se mantiene quieto en su posición, y cada downlink de `SERVO_PULSO_MIN` o `SERVO_PULSO_MAX` lo mueve directo a ese valor, `3` **sintonización de PID** -- el servo lo maneja el PID normal exactamente igual que en `0`, pero es el único modo en que `PID_KP/KI/KD` se aceptan (y activa el log `PID_TEST`, ver sección 9); a diferencia de `1`/`2`, el motor SÍ puede seguir operando en `3` sin que se fuerce de vuelta a `0` (la sintonización lo requiere). En `1` o `2` se habilita cambiar `SERVO_PULSO_MIN/MAX`. El firmware fuerza `CONTROL_HABILITADO=0` localmente en el instante que el motor arranca **solo si estaba en `1` o `2`** (nunca en `3`), y también fuerza a `0` en cada arranque del firmware (`CalibFlash_Init()`), sin importar el valor que haya quedado guardado en flash de una sesión anterior — nunca reanuda ningún modo de calibración solo. **Medida de seguridad adicional**: al entrar a `1`, `2` o `3` (downlink aceptado con valor != 0), `SET_RPM` se limpia a `0` (su estado "sin comandar") — evita que un `SET_RPM` que haya quedado de una operación anterior active el PID solo con el motor arrancando en modo `3`, sin que el operador lo haya vuelto a pedir explícitamente para esa sesión. Mismo criterio en el camino de regreso: cuando el apagado de seguridad de `main.c` fuerza `CONTROL_HABILITADO` de `1`/`2` de vuelta a `0` (motor arrancando durante calibración del servo), también limpia `SET_RPM` a `0` — por si se había mandado un `SET_RPM` mientras se calibraba (categoría Proceso, siempre se acepta, sin importar el modo), que no quede activando el PID solo al volver a operación normal |
 | 14 | `INTERVALO_ENVIO_OPERATIVO_S` | directo (s) | 2B uint16 | Configuración | Uplink en operación |
 | 15 | `INTERVALO_ENVIO_STANDBY_S` | directo (s) | 2B uint16 | Configuración | Uplink en standby |
 | 16 | `MODO` | — | 1B | Configuración | 0=Ralentí, 1=Local, 2=Remoto |
@@ -477,29 +776,91 @@ Modo 2: Remoto        - gobernado por presion del aspersor (downlink PRESION)
 Independiente de 4.1-4.3 — no es un modo de operación del motor, es el
 mecanismo para ajustar en banco los topes mecánicos del acelerador
 (`SERVO_PULSO_MIN/MAX`) sin reflashear, descrito en detalle en la
-sección 2.4:
+sección 2.4. `CONTROL_HABILITADO=0` en realidad cubre dos sub-casos,
+resueltos en `main.c` cada vuelta del loop según el motor **y** si se
+comandó control (`SET_RPM > RPM_MIN`, ver 2.4):
 
 ```
-SEGURO       (CONTROL_HABILITADO=0): servo fijo/regresando a
-                                      SERVO_PULSO_MIN (sin aceleración).
-                                      Estado por defecto.
-CALIBRACIÓN  (CONTROL_HABILITADO=1): servo en barrido continuo
-                                      MIN <-> MAX. Requiere motor
-                                      detenido para entrar.
+CALIBRACIÓN-BARRIDO (CONTROL_HABILITADO=1): servo en barrido continuo
+                                     MIN <-> MAX. Requiere motor
+                                     detenido para entrar y para
+                                     permanecer -- se sale solo si el
+                                     motor arranca.
+CALIBRACIÓN-MANUAL  (CONTROL_HABILITADO=2): servo quieto en su
+                                     posición actual; cada downlink de
+                                     SERVO_PULSO_MIN o SERVO_PULSO_MAX
+                                     lo mueve directo a ese valor.
+                                     Requiere motor detenido para
+                                     entrar y para permanecer, igual
+                                     que el barrido.
+SINTONIZACIÓN-PID   (CONTROL_HABILITADO=3): el servo lo maneja el PID
+                                     normal, EXACTAMENTE igual que en
+                                     SEGURO/PID ACTIVO -- lo único que
+                                     cambia es que PID_KP/KI/KD se
+                                     desbloquean y se activa el log
+                                     PID_TEST (ver sección 9). Requiere
+                                     motor detenido para ENTRAR, pero a
+                                     diferencia de los dos modos de
+                                     arriba, el motor SÍ puede arrancar
+                                     y seguir operando sin que se
+                                     fuerce la salida -- la
+                                     sintonización en lazo cerrado
+                                     necesita el motor corriendo todo
+                                     el tiempo (README sección 9).
+SEGURO      (CONTROL_HABILITADO=0 o =3, motor detenido, O motor
+             operando en su ralentí natural sin SET_RPM > RPM_MIN
+             comandado):             servo fijo/regresando a
+                                     SERVO_PULSO_MIN (sin
+                                     aceleración). Estado por defecto.
+PID ACTIVO  (CONTROL_HABILITADO=0 o =3, motor operando, Y SET_RPM >
+             RPM_MIN comandado explícitamente): servo controlado por
+                                     pid.c/h (ver 2.4), no por una
+                                     posición fija.
 ```
 
-- `SEGURO -> CALIBRACIÓN`: downlink `CONTROL_HABILITADO=1`, solo se
-  acepta con el motor detenido (regla general de 4.1, categoría
-  Configuración) — con el motor operando se rechaza con
-  `REJECTED_ENGINE_RUNNING` (STATUS=5).
-- `CALIBRACIÓN -> SEGURO`: por downlink `CONTROL_HABILITADO=0`, **o**
-  automáticamente en el firmware (sin downlink) si el motor arranca
-  mientras se está calibrando — medida de seguridad, nunca se deja el
-  barrido corriendo con el motor operando.
+- `* -> CALIBRACIÓN-BARRIDO/MANUAL/SINTONIZACIÓN-PID`: downlink
+  `CONTROL_HABILITADO=1`, `=2` o `=3`, solo se acepta con el motor
+  detenido (regla general de 4.1, categoría Configuración) — con el
+  motor operando se rechaza con `REJECTED_ENGINE_RUNNING` (STATUS=5).
+  Esto aplica igual a `=3`, aunque su propósito sea usarse con el motor
+  corriendo — hay que entrar **antes** de arrancarlo.
+- `CALIBRACIÓN-BARRIDO ⇄ CALIBRACIÓN-MANUAL ⇄ SINTONIZACIÓN-PID`: por
+  downlink directo entre `1`, `2` y `3` (los tres requieren motor
+  detenido para el cambio, igual que entrar desde `SEGURO`). Al entrar
+  a `CALIBRACIÓN-MANUAL` el servo arranca quieto en la posición en la
+  que estaba (no salta a `SERVO_PULSO_MIN` ni `MAX`) hasta el primer
+  downlink de esos dos parámetros.
+- `CALIBRACIÓN-BARRIDO/MANUAL -> SEGURO`: por downlink
+  `CONTROL_HABILITADO=0`, **o** automáticamente en el firmware (sin
+  downlink) si el motor arranca mientras se está en uno de esos dos
+  modos — medida de seguridad, nunca se deja el servo bajo barrido o
+  posición manual con el motor operando. Si además ya había un
+  `SET_RPM > RPM_MIN` comandado desde antes, ese mismo arranque cae
+  directo en `PID ACTIVO` en vez de `SEGURO`. **`SINTONIZACIÓN-PID` no
+  tiene esta salida automática** — el motor arrancando ahí es
+  justamente lo esperado, no una condición de falla.
+- `SEGURO ⇄ PID ACTIVO` (dentro de `CONTROL_HABILITADO=0` **o** `=3`):
+  automático según `Tacometro_EstaDetenido()` y si `SET_RPM` supera
+  `RPM_MIN`, sin downlink de por medio para el motor (arrancar/detener
+  basta) — el ralentí (Modo 0, sección 4.3) es deliberadamente sin
+  control, nunca se recorta `SET_RPM` hacia arriba hasta `RPM_MIN` para
+  forzar el lazo. Al entrar a `PID ACTIVO` se llama `PID_Init()` una
+  sola vez (flanco de entrada), para no arrastrar estado de una
+  activación anterior. El comportamiento del servo es idéntico en `0`
+  y en `3` — la diferencia entre ambos está solo en qué parámetros se
+  pueden tocar y si se ve el log `PID_TEST`, no en el control en sí.
 - `SERVO_PULSO_MIN/MAX` solo se pueden cambiar por downlink estando en
-  `CALIBRACIÓN`; fuera de ese modo se rechazan con `APPLY_ERROR`
-  (STATUS=4) aunque el motor esté apagado. El cambio tiene efecto
-  inmediato sobre el barrido en curso.
+  `CALIBRACIÓN-BARRIDO` o `CALIBRACIÓN-MANUAL` (NO en
+  `SINTONIZACIÓN-PID`); fuera de esos dos modos se rechazan con
+  `APPLY_ERROR` (STATUS=4) aunque el motor esté apagado. En
+  `CALIBRACIÓN-BARRIDO` el cambio tiene efecto inmediato sobre el
+  barrido en curso; en `CALIBRACIÓN-MANUAL` mueve el servo directo al
+  valor recién configurado.
+- `PID_KP/PID_KI/PID_KD` solo se pueden cambiar estando en
+  `SINTONIZACIÓN-PID` (`CONTROL_HABILITADO=3`); en cualquier otro modo
+  (incluida la operación normal, `=0`) se rechazan con `APPLY_ERROR`,
+  motor operando o no — evita que las ganancias del PID cambien fuera
+  de una sesión deliberada de sintonización.
 
 ---
 
@@ -660,16 +1021,45 @@ escala del firmware).
 3. Confirmar en el monitor serie del G431 (`Downlink ID=... STATUS=...`)
    y en el cliente MQTT (`RIO/DSL/DECODED`).
 
+**Sin red LoRa disponible** (ej. en banco, o en campo antes de tener
+cobertura): usar el mando manual por serial en su lugar, escribiendo
+directo en el mismo monitor de depuración — ver `comando_serial.c/h`,
+sección 2.7. Mismo nombre y mismo valor humano que en el paso 2, ej.
+escribir `SET_RATIO 17.5` y Enter.
+
 ---
 
 ## 8. Pendientes generales
 
-- [ ] PID (`Kp/Ki/Kd`) — a la espera de simulación en MATLAB. Salida
-      del PID debe ser en microsegundos directos (mismo dominio que
-      `Servo_SetPulsoUs()`).
-- [ ] Posible parámetro 25, `INTEGRAL_MAX` (anti-windup del PID).
+- [x] Lazo PID (`pid.c/h`) implementado y activo en `main.c` (motor
+      operando, sin calibración) — ver secciones 2.4 y 4.4.
+- [ ] Ganancias reales `PID_KP/KI/KD` — siguen en default (`1.0/0/0`),
+      pendientes de sintonizar en el motor real. Ver sección 9 para el
+      procedimiento (Ziegler-Nichols en lazo cerrado, sin MATLAB) — solo
+      se pueden tocar en `CONTROL_HABILITADO=3`.
+- [x] **AWS**: `send_downlink.py`'s `PARAMETER_TABLE["CONTROL_HABILITADO"]["max"]`
+      subido de `2` a `3` para aceptar el nuevo modo de sintonización de
+      PID (mismo ajuste que ya se había hecho cuando se agregó el valor
+      `2`).
+- [ ] Setpoint real del PID — hoy usa `SET_RPM` (prueba manual); falta
+      conectarlo a la máquina Modo 0/1/2 (sección 4.3) para que la
+      presión decida el objetivo de RPM.
+- [ ] Posible parámetro 25, `INTEGRAL_MAX` (anti-windup configurable
+      del PID) — hoy el anti-windup es fijo en `pid.c` (integración
+      condicional, sin límite configurable por downlink).
 - [ ] Máquina de estados Modo 0/1/2 (sección 4.3) — sin implementar en
-      firmware.
+      firmware. Mientras tanto, la distinción "Modo 0 (ralentí, sin
+      control) vs. control activo" ya existe pero **implícita**: se
+      infiere solo de `SET_RPM > RPM_MIN` (ver 2.4/4.4), sin ninguna
+      señal explícita de modo.
+- [ ] `MODO` (ID 16) — existe en el protocolo (persistido, con
+      getter/setter) pero **nadie lo lee** en `main.c`, igual que
+      estaba `CONTROL_HABILITADO` antes de cablearlo. Además su enum
+      en código (`CALIB_MODO_MANUAL/AUTOMATICO/MANTENIMIENTO`,
+      `calibracion_flash.h`) **no coincide** con los nombres que usa
+      el README (`Ralentí/Local/Remoto`, tabla de parámetros y sección
+      4.3) — hay que decidir la terminología real y corregir el enum
+      antes de conectarlo, no después.
 - [ ] Construcción física y prueba del circuito de presión (LM358).
 - [ ] `presion.c/h` — módulo de lectura/conversión, sin escribir aún.
       Una vez que exista, conectar el estado `ACTIVO` (sección 4.2) a
@@ -696,3 +1086,234 @@ escala del firmware).
       `ERROR` ocasionalmente (ej. si el GPS ya estaba encendido de un
       arranque anterior) necesita manejarse distinto, o si es
       inofensivo como parece hasta ahora.
+- [ ] **Reinicios espontáneos del RAK3172 en campo (2026-08-29)** — ver
+      sección 2.2. El módulo se reinicia solo (banner de arranque
+      reaparece en medio de la sesión), a veces en ciclo continuo.
+      Sospecha actual: conexión de antena o alimentación (picos de
+      corriente de TX de LoRa), no software — el firmware ya detecta y
+      reintenta el join correctamente cuando pasa, pero la causa raíz
+      del reinicio en sí sigue sin confirmarse. Revisar cable/conector
+      de antena y estabilidad del rail de alimentación del RAK3172
+      durante una transmisión (osciloscopio o multímetro en modo
+      min/max), y considerar más capacitancia de desacople local.
+- [ ] Decidir si `AutoJoin` en `RAK3172_Join()` (`AT+JOIN=1:0:10:8`)
+      vuelve a `1` para producción, o se queda en `0` (prueba temporal
+      actual, ver 2.2) manejando todos los reintentos desde el host.
+- [ ] Quitar los prints de `DIAGNOSTICO TEMPORAL` en `rak3172.c`
+      (`RAK3172_ProcesarLinea()` imprimiendo toda línea cruda, y
+      `RAK3172_ErrorCallback()`) y `gps.c` (`GPS_ErrorCallback()`) una
+      vez confirmada en campo la causa raíz de los reinicios del
+      RAK3172 — agregados el 2026-08-29 solo para diagnóstico, ver 2.2.
+
+---
+
+## 9. Sintonización del PID en el motor real (sin MATLAB)
+
+No se usa MATLAB para este proyecto — la sintonización se hace
+empírica, directo en el motor real, con los mismos mandos que ya
+existen (downlink MQTT o el mando manual por serial de la sección
+2.7). No hace falta ningún software externo para lograrlo, aunque un
+script de Python puede ayudar a analizar los datos (ver más abajo).
+
+### Por qué hace falta sintonizar (y no solo probar `Kp=1` a ojo)
+
+El PID no "sabe" nada del motor — solo reacciona al error entre
+`SET_RPM` y la RPM medida. Las ganancias determinan qué tan agresiva
+es esa reacción:
+
+- **`Kp` muy alto**: el servo sobre-corrige, la RPM se pasa del
+  setpoint, vuelve a corregir de más en la otra dirección → oscilación
+  (el motor "bombea" RPM arriba y abajo). Además de ser inútil para
+  operación real, es estrés mecánico repetido sobre la varilla del
+  acelerador.
+- **`Kp` muy bajo**: reacciona lento y se queda con bastante error de
+  estado estable (lo que ya viste con el default `Kp=1.0` en modo
+  puramente proporcional).
+- **`Ki`**: elimina el error de estado estable que deja un `Kp` por sí
+  solo, pero mal puesto agrega sobre-impulso (overshoot) y puede
+  tardar en "soltar" la corrección (aunque ya hay anti-windup por
+  integración condicional en `pid.c`, ver sección 2.4).
+- **`Kd`**: amortigua el sobre-impulso que puede dejar `Ki`, pero
+  reacciona a qué tan rápido *cambia* el error — con una medición de
+  RPM que ya de por sí "caza" en ralentí (ver la conversación sobre la
+  aguja/ralentí inestable, sección 2.1), un `Kd` puesto a la ligera
+  amplifica ese ruido en vez de suavizar el control, y el servo se
+  pone nervioso. Si se usa, hacerlo con `Kd` pequeño y considerar bajar
+  `ALPHA` primero para llegar con una RPM ya más filtrada.
+
+El objetivo de "simular" (en MATLAB, Python, o cualquier otra
+herramienta) es siempre el mismo: **probar combinaciones de ganancias
+sin gastar tiempo de motor real ni arriesgar una oscilación fuerte en
+la varilla física** — se prueba en una computadora primero, y solo se
+valida en el motor la combinación que ya se ve razonable en papel. Acá
+se salta ese paso intermedio y se sintoniza directo en el motor, con
+más cuidado y de forma incremental.
+
+### Restricción importante del firmware: no hay "lazo abierto" con el motor operando
+
+`CONTROL_HABILITADO=1`/`=2` (barrido/manual, sección 2.4) — que sí
+permitirían mandar un pulso fijo al servo sin que el PID reaccione —
+**requieren el motor detenido para entrar y para permanecer**, y si el
+motor arranca estando en cualquiera de esos dos modos, el firmware los
+apaga solo de inmediato (medida de seguridad, ver 4.4). Esto es
+intencional y no se debe evadir: significa que **no se puede hacer una
+prueba de "curva de reacción" en lazo abierto** (mandar un escalón de
+pulso fijo y medir cómo responde la RPM) con el motor corriendo —
+cualquier prueba en el motor real va a ser necesariamente **en lazo
+cerrado**, con el PID ya corriendo. Por suerte, hay un método de
+sintonización estándar pensado exactamente para esto: **Ziegler-Nichols
+en lazo cerrado (ganancia última)**.
+
+### Procedimiento (Ziegler-Nichols en lazo cerrado)
+
+1. **Con el motor detenido**, mandar `CONTROL_HABILITADO=3` (modo
+   sintonización PID, ver sección 4.4) — es el único modo en el que
+   `PID_KP/KI/KD` se aceptan; en cualquier otro modo (incluida la
+   operación normal, `=0`) se rechazan con `APPLY_ERROR`, por medida de
+   seguridad (que no se puedan tocar las ganancias por accidente fuera
+   de una sesión deliberada). A diferencia de `=1`/`=2`, este modo
+   **no** se apaga solo cuando el motor arranca — hace falta que siga
+   operando toda la sesión. Arrancar el motor y dejarlo estabilizar en
+   ralentí caliente.
+2. Confirmar `PID_KI=0` y `PID_KD=0` (default de fábrica) — se
+   sintoniza `Kp` solo primero.
+3. Mandar un `SET_RPM` por encima de `RPM_MIN` (un escalón moderado,
+   no extremo — ej. 200-300 RPM sobre el ralentí, no el máximo del
+   motor) y observar la respuesta en el log de debug (`RPM filtrada`,
+   cada 1s) o mejor, capturando el log completo a un archivo (log de
+   PuTTY/Tera Term, o un script de Python leyendo el puerto COM y
+   guardando CSV con marca de tiempo) para poder medirlo con precisión
+   después en vez de a ojo.
+4. Ir subiendo `Kp` en pasos pequeños (ej. `PID_KP 1.5`, `PID_KP 2.0`,
+   ...) repitiendo el mismo escalón de `SET_RPM` cada vez, hasta que la
+   RPM empiece a **oscilar de forma sostenida** (ni crece sin control
+   ni se apaga, se mantiene oscilando con amplitud pareja alrededor del
+   setpoint). Ese valor de `Kp` es la **ganancia última (`Ku`)**; medí
+   el período de esa oscilación (tiempo entre dos picos consecutivos)
+   — es el **período último (`Tu`)**.
+   ⚠️ Al acercarte a `Ku` la RPM va a oscilar de verdad — tené a mano
+   `SET_RPM 0` (por serial o MQTT) para cortar el lazo de inmediato si
+   se ve demasiado agresivo, y no dejes esta prueba desatendida.
+5. Con `Ku` y `Tu` medidos, aplicar las fórmulas clásicas de
+   Ziegler-Nichols (elegir según qué tan agresivo se quiera el control
+   final):
+   ```
+   Solo P:    Kp = 0.50 * Ku
+   PI:        Kp = 0.45 * Ku          Ki = Kp / (Tu / 1.2)
+   PID:       Kp = 0.60 * Ku          Ki = Kp / (Tu / 2)      Kd = Kp * (Tu / 8)
+   ```
+   Para un acelerador diésel, conviene arrancar por la fila **PI** (sin
+   `Kd`) dado el ruido de medición ya conocido en el ralentí — agregar
+   `Kd` solo si de verdad hace falta amortiguar más el sobre-impulso, y
+   con cautela.
+6. Cargar esas ganancias (`PID_KP`/`PID_KI`/`PID_KD` por downlink o
+   serial) y repetir el escalón de `SET_RPM` del paso 3 — buscar una
+   respuesta que llegue al setpoint sin oscilar más de una vez y sin
+   error de estado estable notorio. Ajustar a mano desde ahí si hace
+   falta (bajar un poco `Kp`/`Ki` si todavía se pasa de largo).
+
+### Dónde sí ayuda un script de Python
+
+No hace falta para ejecutar el procedimiento de arriba (es 100% de
+campo, con los mandos que ya existen), pero sí ayuda para analizarlo
+mejor que a ojo sobre el log crudo:
+
+- Parsear el log capturado (serial o CSV) a una serie de tiempo real,
+  y graficarla (`matplotlib`) — ver la oscilación sostenida del paso 4
+  y medir `Tu` con precisión (distancia entre picos) es mucho más
+  confiable en un gráfico que contando segundos en la terminal.
+- Automatizar el cálculo de las fórmulas de Ziegler-Nichols del paso 5
+  a partir de `Ku`/`Tu` medidos, para no hacerlo a mano.
+- Si en algún momento se quiere ir más allá de Ziegler-Nichols (ajustar
+  fino con un modelo real del sistema), se puede ajustar una curva a
+  la respuesta capturada (ej. `scipy.optimize.curve_fit` contra un
+  modelo de segundo orden) y usar ese modelo para probar más
+  combinaciones de ganancias en la computadora antes de volver a tocar
+  el motor — es exactamente el rol que iba a cumplir MATLAB, solo que
+  con datos reales del motor en vez de un modelo teórico.
+
+**Ya existe una implementación de esto** en [`tools/pid_tuning/`](../tools/pid_tuning/)
+(`pid_tuning.py`): parsea el log `PID_TEST` capturado, identifica el
+modelo de planta FOPDT (`K`/`tau`/`L`) de un escalón real en lazo
+cerrado, busca `Ku`/`Tu` con Ziegler-Nichols **sobre el modelo
+simulado** (sin oscilar el motor real), y sugiere ganancias P/PI/PID —
+ver el `README.md` de esa carpeta para el flujo completo con ejemplos
+de comandos. Replica a mano la lógica exacta de `PID_CalcularSalidaUs()`
+(`pid.c`) para que la simulación sea fiel al firmware real; si `pid.c`
+cambia, esa réplica en Python hay que actualizarla también.
+
+### Alternativa más segura: identificar el modelo sin llevar el motor a oscilar
+
+El paso 4 de arriba (subir `Kp` hasta oscilación sostenida) funciona,
+pero implica hacer oscilar el motor real a propósito. Se puede evitar
+por completo si lo que se quiere es simular en Python antes de tocar
+ganancias agresivas en el motor: alcanza con **una sola prueba segura**
+con las ganancias de fábrica (`Kp=1, Ki=0, Kd=0` — ya sabemos que esto
+no oscila, solo deja error de estado estable).
+
+1. Motor estable, mandar un escalón moderado de `SET_RPM` (ej.
+   +200-300 RPM) y capturar el log `PID_TEST` (ver más abajo) hasta que
+   se estabilice.
+2. De la curva capturada, medir:
+   - `ΔSET_RPM`: tamaño del escalón mandado.
+   - `ΔRPM_ss`: cuánto subió la RPM en estado estable (menor que
+     `ΔSET_RPM`, por el error de P puro).
+   - `L`: retraso (s) entre el escalón y que la RPM empiece a moverse
+     (incluye el slew-rate del servo y el retraso mecánico del motor).
+   - `τ_cl`: tiempo desde que empieza a moverse hasta llegar al 63.2%
+     del cambio total.
+3. Como el lazo es proporcional puro con `Kp` conocido, se puede
+   despejar la planta en lazo abierto (realimentación unitaria sobre
+   una planta de primer orden):
+   ```
+   G_cl = ΔRPM_ss / ΔSET_RPM
+
+   K = G_cl / (Kp * (1 - G_cl))     -- ganancia de la planta (RPM/µs)
+   τ = τ_cl / (1 - G_cl)            -- constante de tiempo de la planta
+   L ≈ L_cl                          -- el retraso no cambia con la realimentación
+   ```
+4. Con `K`/`τ`/`L` ya hay un modelo FOPDT (first-order-plus-dead-time)
+   simulable en Python. Replicar ahí **la lógica exacta de `pid.c`**
+   (mismo clamp `[0, rango]`, mismo anti-windup, mismo reset de
+   integral con `Ki=0`) sobre ese modelo, y recién ahí sí buscar `Ku`/
+   `Tu` subiendo `Kp` **en la simulación**, sin riesgo real. Validar la
+   combinación ganadora en el motor real repitiendo el escalón del
+   paso 1.
+5. Este modelo es una aproximación lineal válida cerca del punto de
+   operación donde se hizo la prueba — repetir con 1-2 escalones de
+   tamaño distinto para confirmar que `K`/`τ`/`L` salen parecidos antes
+   de confiar en él.
+
+### Log `PID_TEST` para capturar los escalones (agregado en `main.c`)
+
+Línea de log dedicada, en formato CSV, para no tener que parsear el
+resto del texto intercalado en el monitor serie (RAK3172, GPS, eco del
+mando manual, etc.):
+
+```
+PID_TEST,<ms_desde_arranque>,<SET_RPM>,<RPM_filtrada>,<pulso_servo_us>
+```
+
+- Se imprime cada `200ms` (5Hz) — mucho más seguido que el log general
+  de 1s, para tener suficientes puntos por constante de tiempo al
+  ajustar la curva.
+- **Solo se activa en `CONTROL_HABILITADO=3`** (modo sintonización PID,
+  ver sección 4.4) — la misma condición que desbloquea
+  `PID_KP/KI/KD`, una sola fuente de verdad para "¿estamos en una
+  sesión de sintonización?". Fuera de ese modo el monitor se ve
+  exactamente como antes de que existiera este log (solo la línea de
+  1s). Se apaga solo en cuanto se sale del modo `3` (downlink
+  `CONTROL_HABILITADO=0`).
+- Usa `HAL_GetTick()` (ms desde el arranque), **no** la hora del RTC —
+  el RTC se resincroniza cada ~30s por GPS/LoRaWAN (sección 2.2) y esas
+  correcciones contaminarían el tiempo relativo de un escalón en
+  curso; `HAL_GetTick()` es monótono y no depende de si el reloj ya
+  sincronizó.
+- Incluye el **pulso real aplicado al servo** (`Servo_GetPulsoActualUs()`),
+  no solo el setpoint — importante porque `SERVO_VELOCIDAD_MAX_US_S`
+  (sección 2.4) limita qué tan rápido puede moverse el pulso real, así
+  que el valor efectivamente aplicado puede ir por detrás de lo que el
+  PID "pidió" ese ciclo.
+- Para capturarlo: log del terminal (PuTTY/Tera Term) o un script
+  leyendo el puerto COM, filtrando las líneas que empiecen con
+  `PID_TEST,` antes de armar el CSV para Python.

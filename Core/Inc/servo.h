@@ -48,6 +48,18 @@ extern "C" {
  * original (25µs cada 20ms). */
 #define SERVO_VELOCIDAD_MAX_US_S    1250U
 
+/* Pausa en cada extremo del barrido de calibración (main.c,
+ * CONTROL_HABILITADO=1), en ms. El pulso PWM comandado llega exacto a
+ * SERVO_PULSO_MIN/MAX apenas se cumple el límite de velocidad de
+ * arriba, pero el servo físico tiene su propio tiempo de asentamiento
+ * (no es instantáneo) -- sin esta pausa, el firmware invierte la
+ * dirección en la misma vuelta del loop en que el pulso llega al
+ * extremo, y el brazo real nunca alcanza a terminar de llegar antes de
+ * que se le pida ir al otro lado. No configurable por downlink, a
+ * propósito -- es un margen mecánico fijo, igual que
+ * SERVO_VELOCIDAD_MAX_US_S. */
+#define SERVO_BARRIDO_PAUSA_EXTREMOS_MS    1000U
+
 /* ==================== API PÚBLICA ==================== */
 
 /**
@@ -81,11 +93,10 @@ uint16_t Servo_SetPulsoUs(uint16_t microsegundos);
  * llamada anterior; si el destino ya se alcanzó, no hace nada más que
  * mantenerlo.
  *
- * Pensada para ser el único camino de movimiento del servo una vez
- * que exista un lazo de control real: tanto la prueba de banco (barrido
- * entre límites) como la salida futura del PID (en µs directos, ver
- * README sección 8) deben llamar esta función en vez de
- * Servo_SetPulsoUs() directamente, para heredar el límite de
+ * Único camino de movimiento del servo mientras hay un lazo activo:
+ * tanto el barrido de calibración (main.c) como la salida de pid.c
+ * (en µs directos, ver README sección 2.4/4.4) llaman esta función en
+ * vez de Servo_SetPulsoUs() directamente, para heredar el límite de
  * velocidad mecánica.
  *
  * @param destinoUs  Ancho de pulso deseado, en µs (se recorta contra

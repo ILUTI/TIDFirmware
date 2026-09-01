@@ -52,6 +52,18 @@ static float           s_latitud = 0.0f;
 static float           s_longitud = 0.0f;
 static volatile uint32_t s_ultimoFixTickMs = 0;
 
+/* Fecha/hora UTC del último fix (campos "fecha ddmmyy"/"hora hhmmss.s"
+ * de "+CGPSINFO:", ver GPS_ProcesarCGPSInfo()). s_fechaHoraValida se
+ * pone en false cuando se pierde el fix -- igual que s_tieneFix, para
+ * que GPS_GetFechaHoraUtc() nunca entregue una hora de un fix viejo. */
+static bool     s_fechaHoraValida = false;
+static uint16_t s_fhAnio = 0;
+static uint8_t  s_fhMes = 0;
+static uint8_t  s_fhDia = 0;
+static uint8_t  s_fhHora = 0;
+static uint8_t  s_fhMinuto = 0;
+static uint8_t  s_fhSegundo = 0;
+
 /* Cuenta reportes "+CGPSINFO:" vacíos (sin fix) SEGUIDOS -- se reinicia
  * a 0 en cuanto llega un fix real. Al llegar a
  * GPS_REPORTES_VACIOS_ANTES_DE_REENVIAR, se reenvía "AT+CGPS=1" (ver
@@ -85,6 +97,7 @@ void GPS_Init(UART_HandleTypeDef *huart)
     s_longitud = 0.0f;
     s_ultimoFixTickMs = 0;
     s_reportesVaciosSeguidos = 0;
+    s_fechaHoraValida = false;
 
     /* Igual que en RAK3172_Init(): limpiar flags de error y vaciar el
      * registro de datos antes de arrancar, por si quedó algo colgado
@@ -169,6 +182,36 @@ void GPS_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     __HAL_UART_CLEAR_FEFLAG(s_huart);
 }
 
+void GPS_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (s_huart == NULL || huart->Instance != s_huart->Instance) {
+        return;
+    }
+
+    /* ⚠️ DIAGNOSTICO TEMPORAL -- ver nota en RAK3172_ErrorCallback().
+     * Quitar una vez confirmado si este callback llega a dispararse. */
+    printf("GPS: HAL_UART_ErrorCallback disparado (ErrorCode=0x%08lX) -- rearmando recepcion\r\n",
+           (unsigned long)s_huart->ErrorCode);
+
+    __HAL_UART_CLEAR_OREFLAG(s_huart);
+    __HAL_UART_CLEAR_FEFLAG(s_huart);
+    __HAL_UART_CLEAR_NEFLAG(s_huart);
+    __HAL_UART_CLEAR_PEFLAG(s_huart);
+    volatile uint32_t dummy = s_huart->Instance->RDR;
+    (void)dummy;
+
+    /* Descartar la sentencia a medio construir -- pudo quedar corrupta
+     * o incompleta por el mismo error que disparo este callback. */
+    s_lineaLen = 0;
+
+    /* Rearrancar el DMA en modo Circular reinicia su puntero interno
+     * de escritura a 0 -- s_ultimaPosLeida debe volver a 0 junto con
+     * el, o quedaria leyendo desde una posicion que ya no corresponde
+     * al contenido real del buffer. */
+    s_ultimaPosLeida = 0;
+    HAL_UARTEx_ReceiveToIdle_DMA(s_huart, s_rxDmaBuffer, GPS_RX_BUFFER_SIZE);
+}
+
 void GPS_Update(void)
 {
     while (s_colaCount > 0) {
@@ -213,6 +256,22 @@ float GPS_GetLongitud(void)
 uint32_t GPS_GetUltimoFixTickMs(void)
 {
     return s_ultimoFixTickMs;
+}
+
+bool GPS_GetFechaHoraUtc(uint16_t *anio, uint8_t *mes, uint8_t *dia,
+                          uint8_t *hora, uint8_t *minuto, uint8_t *segundo)
+{
+    if (!s_tieneFix || !s_fechaHoraValida) {
+        return false;
+    }
+
+    *anio = s_fhAnio;
+    *mes = s_fhMes;
+    *dia = s_fhDia;
+    *hora = s_fhHora;
+    *minuto = s_fhMinuto;
+    *segundo = s_fhSegundo;
+    return true;
 }
 
 /* ==================== FUNCIONES PRIVADAS ==================== */
@@ -284,6 +343,7 @@ static void GPS_ProcesarCGPSInfo(char *linea)
      * ya es directamente el campo de latitud. */
     if (campos[0][0] == '\0') {
         s_tieneFix = false; /* sin fix -- se conserva la ultima lat/lon conocida */
+        s_fechaHoraValida = false;
 
         s_reportesVaciosSeguidos++;
         if (s_reportesVaciosSeguidos >= GPS_REPORTES_VACIOS_ANTES_DE_REENVIAR) {
@@ -317,6 +377,33 @@ static void GPS_ProcesarCGPSInfo(char *linea)
     s_tieneFix = true;
     s_reportesVaciosSeguidos = 0;
     s_ultimoFixTickMs = HAL_GetTick();
+
+    /* campos[4]="fecha ddmmyy", campos[5]="hora hhmmss.s" (UTC, del
+     * propio receptor GNSS) -- se descarta la parte fraccionaria de
+     * los segundos. n>=6 garantiza que ambos campos existen (pueden
+     * venir vacíos en teoría, aunque no debería pasar con fix válido,
+     * de ahí el chequeo de longitud). */
+    if (n >= 6 && strlen(campos[4]) >= 6 && strlen(campos[5]) >= 6) {
+        char buf[3] = { 0 };
+
+        memcpy(buf, campos[4], 2); buf[2] = '\0';
+        s_fhDia = (uint8_t)atoi(buf);
+        memcpy(buf, campos[4] + 2, 2); buf[2] = '\0';
+        s_fhMes = (uint8_t)atoi(buf);
+        memcpy(buf, campos[4] + 4, 2); buf[2] = '\0';
+        s_fhAnio = (uint16_t)(2000 + atoi(buf));
+
+        memcpy(buf, campos[5], 2); buf[2] = '\0';
+        s_fhHora = (uint8_t)atoi(buf);
+        memcpy(buf, campos[5] + 2, 2); buf[2] = '\0';
+        s_fhMinuto = (uint8_t)atoi(buf);
+        memcpy(buf, campos[5] + 4, 2); buf[2] = '\0';
+        s_fhSegundo = (uint8_t)atoi(buf);
+
+        s_fechaHoraValida = true;
+    } else {
+        s_fechaHoraValida = false;
+    }
 }
 
 static uint8_t GPS_DividirCampos(char *sentencia, char *campos[], uint8_t maxCampos)

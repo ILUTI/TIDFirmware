@@ -50,7 +50,7 @@
 #define DEFAULT_SERVO_PULSO_MAX_US        2000U
 #define DEFAULT_TIMEOUT_SIN_COMANDO_S     1800U   /* 30 min, mayor al Estado 1 del aspersor (15-20 min) */
 #define DEFAULT_TASA_MAX_CAMBIO_RPM_S     50.0f
-#define DEFAULT_CONTROL_HABILITADO        false
+#define DEFAULT_CONTROL_HABILITADO        0U
 #define DEFAULT_INTERVALO_OPERATIVO_S     30U
 #define DEFAULT_INTERVALO_STANDBY_S       300U
 #define DEFAULT_MODO                      CALIB_MODO_MANUAL
@@ -97,7 +97,12 @@ typedef struct {
     uint16_t intervaloStandbyS;        /* INTERVALO_ENVIO_STANDBY_S */
     uint16_t histeresisModoS;          /* HISTERESIS_MODO_S */
 
-    uint8_t  controlHabilitado;        /* CONTROL_HABILITADO (0/1) */
+    uint8_t  controlHabilitado;        /* CONTROL_HABILITADO (0/1/2) -- se
+                                         * persiste en flash como cualquier otro
+                                         * parametro CONFIGURACION, pero
+                                         * CalibFlash_Init() lo fuerza a 0 en RAM
+                                         * en cada arranque (ver mas abajo), nunca
+                                         * arranca directo en modo calibracion */
     uint8_t  modo;                     /* MODO (0/1/2) */
     uint8_t  nodeId;                   /* NODE_ID */
     uint8_t  relleno[7];               /* completa a múltiplo de 8 bytes -- ajustar si
@@ -121,6 +126,15 @@ static float s_presion = 0.0f;
 /* Banderas de comandos */
 static volatile bool s_reporteForzadoPendiente = false;
 static volatile bool s_resetPendiente = false;
+
+/* Objetivo pendiente para el modo manual de calibracion del servo
+ * (CONTROL_HABILITADO=2, ver main.c) -- se marca aqui cuando un downlink
+ * de SERVO_PULSO_MIN/MAX se aplica con exito estando en ese modo, y
+ * main.c lo consume y limpia en la siguiente vuelta del loop. Por
+ * bandera (no por comparar valores) para que un downlink que repite el
+ * valor ya guardado (ej. los defaults de fabrica) igual mueva el servo. */
+static volatile bool s_objetivoManualServoPendiente = false;
+static volatile uint16_t s_objetivoManualServoUs = 0U;
 
 /* Se pone en true si la última llamada a CalibFlash_EscribirEnFlash()
  * falló por un error real de hardware (borrado/programación), en vez
@@ -149,6 +163,17 @@ void CalibFlash_Init(void)
         /* ultimaHoraUtcConocida/ultimaLatitudConocida/ultimaLongitudConocida
          * vienen tal cual estaban en flash -- NO se tocan aca, son
          * justamente los valores que queremos preservar entre arranques. */
+        s_datos.controlHabilitado = 0U; /* CONTROL_HABILITADO NUNCA arranca en
+                                           * modo calibracion (1 o 2), sin importar
+                                           * lo que haya quedado guardado en flash
+                                           * -- medida de seguridad: si se fue la
+                                           * energia mientras se calibraba, al
+                                           * volver el servo debe arrancar en modo
+                                           * seguro (0), no reanudar el barrido ni
+                                           * el modo manual solo. No se reescribe a
+                                           * flash aqui -- queda en 0 en RAM hasta
+                                           * el proximo Set explicito, igual que el
+                                           * resto de esta funcion. */
     } else {
         memset(&s_datos, 0, sizeof(s_datos));
         s_datos.magic = CALIB_FLASH_MAGIC;
@@ -174,7 +199,7 @@ void CalibFlash_Init(void)
         s_datos.intervaloOperativoS      = DEFAULT_INTERVALO_OPERATIVO_S;
         s_datos.intervaloStandbyS        = DEFAULT_INTERVALO_STANDBY_S;
         s_datos.histeresisModoS          = DEFAULT_HISTERESIS_MODO_S;
-        s_datos.controlHabilitado        = DEFAULT_CONTROL_HABILITADO ? 1U : 0U;
+        s_datos.controlHabilitado        = DEFAULT_CONTROL_HABILITADO;
         s_datos.modo                     = (uint8_t)DEFAULT_MODO;
         s_datos.nodeId                   = DEFAULT_NODE_ID;
         /* No se escribe a flash aquí -- solo al primer Set explícito. */
@@ -198,6 +223,20 @@ static CalibFlash_Categoria_t CalibFlash_CategoriaDe(uint8_t id)
     switch (id) {
         case CALIB_ID_SET_RATIO:
         case CALIB_ID_ALPHA:
+        /* PID_KP/KI/KD como CALIBRACION (no CONFIGURACION por default) --
+         * misma razon que SET_RATIO/ALPHA: la sintonizacion en lazo
+         * cerrado (README seccion 9, metodo Ziegler-Nichols) exige subir
+         * Kp de a poco CON EL MOTOR OPERANDO, observando la respuesta
+         * real de RPM en cada paso -- si cayeran en CONFIGURACION
+         * (bloqueadas con el motor operando), el procedimiento de esa
+         * seccion seria irrealizable. El candado real que evita tocarlas
+         * fuera de una sesion deliberada de sintonizacion NO es esta
+         * categoria -- es el gate explicito por CONTROL_HABILITADO==3
+         * dentro de cada case de abajo (mismo patron que
+         * SERVO_PULSO_MIN/MAX con CONTROL_HABILITADO==1/2). */
+        case CALIB_ID_PID_KP:
+        case CALIB_ID_PID_KI:
+        case CALIB_ID_PID_KD:
             return CALIB_CATEGORIA_CALIBRACION;
 
         case CALIB_ID_SET_RPM:
@@ -209,7 +248,7 @@ static CalibFlash_Categoria_t CalibFlash_CategoriaDe(uint8_t id)
         case CALIB_ID_RESET_REMOTO:
             return CALIB_CATEGORIA_COMANDO;
 
-        /* Todo lo demas (RPM_MAX/MIN, PID_KP/KI/KD, SERVO_PULSO_MIN/MAX,
+        /* Todo lo demas (RPM_MAX/MIN, SERVO_PULSO_MIN/MAX,
          * TIMEOUT_SIN_COMANDO_S, TASA_MAX_CAMBIO_*, CONTROL_HABILITADO,
          * INTERVALO_*, MODO, NODE_ID, HISTERESIS_MODO_S,
          * PRESION_OBJETIVO) cae en CONFIGURACION por el default. */
@@ -289,7 +328,18 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
         }
 
         case CALIB_ID_PID_KP: {
-            /* Escala x100 -- AJUSTAR según resultados de MATLAB. */
+            /* Escala x100. Solo se puede tocar en CONTROL_HABILITADO=3
+             * (modo sintonizacion PID, ver README seccion 4.4/9) -- fuera
+             * de ese modo (incluida la operacion normal, =0) se rechaza
+             * con APPLY_ERROR, aunque el motor este detenido. Mismo
+             * patron que SERVO_PULSO_MIN/MAX con CONTROL_HABILITADO=1/2:
+             * por medida de seguridad, cambiar las ganancias del PID
+             * requiere entrar deliberadamente a sintonizar, no es algo
+             * que deba poder pasar por accidente en operacion normal. */
+            if (CalibFlash_GetControlHabilitado() != 3U) {
+                *valorAplicadoRaw = CodificarInt16ComoRaw(CalibFlash_GetPidKp(), 100.0f);
+                return CALIB_STATUS_APPLY_ERROR;
+            }
             float nuevoValor = (float)LeerInt16BigEndian(datos) / 100.0f;
             bool ok = CalibFlash_SetPidKp(nuevoValor);
             *valorAplicadoRaw = CodificarInt16ComoRaw(CalibFlash_GetPidKp(), 100.0f);
@@ -298,6 +348,11 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
         }
 
         case CALIB_ID_PID_KI: {
+            /* Ver nota de CALIB_ID_PID_KP. */
+            if (CalibFlash_GetControlHabilitado() != 3U) {
+                *valorAplicadoRaw = CodificarInt16ComoRaw(CalibFlash_GetPidKi(), 1000.0f);
+                return CALIB_STATUS_APPLY_ERROR;
+            }
             float nuevoValor = (float)LeerInt16BigEndian(datos) / 1000.0f;
             bool ok = CalibFlash_SetPidKi(nuevoValor);
             *valorAplicadoRaw = CodificarInt16ComoRaw(CalibFlash_GetPidKi(), 1000.0f);
@@ -306,6 +361,11 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
         }
 
         case CALIB_ID_PID_KD: {
+            /* Ver nota de CALIB_ID_PID_KP. */
+            if (CalibFlash_GetControlHabilitado() != 3U) {
+                *valorAplicadoRaw = CodificarInt16ComoRaw(CalibFlash_GetPidKd(), 1000.0f);
+                return CALIB_STATUS_APPLY_ERROR;
+            }
             float nuevoValor = (float)LeerInt16BigEndian(datos) / 1000.0f;
             bool ok = CalibFlash_SetPidKd(nuevoValor);
             *valorAplicadoRaw = CodificarInt16ComoRaw(CalibFlash_GetPidKd(), 1000.0f);
@@ -315,31 +375,48 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
 
         case CALIB_ID_SERVO_PULSO_MIN: {
             /* Solo se puede recalibrar el rango del servo en modo
-             * calibracion (CONTROL_HABILITADO=1) -- ademas del bloqueo
-             * general de CONFIGURACION con el motor operando (arriba),
-             * esto evita que un downlink suelto cambie los topes
-             * mecanicos del acelerador fuera de una sesion de banco
-             * deliberada. */
-            if (!CalibFlash_GetControlHabilitado()) {
+             * calibracion (CONTROL_HABILITADO=1 o =2, NO 3 -- ese es
+             * sintonizacion de PID, no recalibracion mecanica del servo)
+             * -- ademas del bloqueo general de CONFIGURACION con el motor
+             * operando (arriba), esto evita que un downlink suelto
+             * cambie los topes mecanicos del acelerador fuera de una
+             * sesion de banco deliberada. */
+            uint8_t modoActual = CalibFlash_GetControlHabilitado();
+            if (modoActual != 1U && modoActual != 2U) {
                 *valorAplicadoRaw = CalibFlash_GetServoPulsoMinUs();
                 return CALIB_STATUS_APPLY_ERROR;
             }
             uint16_t nuevoValor = LeerUint16BigEndian(datos);
             bool ok = CalibFlash_SetServoPulsoMinUs(nuevoValor);
             *valorAplicadoRaw = CalibFlash_GetServoPulsoMinUs();
+            /* Modo manual (=2): marcar el valor recien aplicado como
+             * objetivo pendiente para que main.c mueva el servo ahi --
+             * por bandera, NO por comparar contra el valor anterior,
+             * porque el valor "nuevo" puede coincidir con el que ya
+             * estaba (ej. los defaults de fabrica) y un downlink real
+             * igual debe mover el servo. */
+            if (ok && CalibFlash_GetControlHabilitado() == 2U) {
+                s_objetivoManualServoUs = CalibFlash_GetServoPulsoMinUs();
+                s_objetivoManualServoPendiente = true;
+            }
             if (ok) return CALIB_STATUS_OK;
             return s_ultimaEscrituraFallo ? CALIB_STATUS_STORAGE_ERROR : CALIB_STATUS_OUT_OF_RANGE;
         }
 
         case CALIB_ID_SERVO_PULSO_MAX: {
             /* Ver nota de CALIB_ID_SERVO_PULSO_MIN. */
-            if (!CalibFlash_GetControlHabilitado()) {
+            uint8_t modoActualMax = CalibFlash_GetControlHabilitado();
+            if (modoActualMax != 1U && modoActualMax != 2U) {
                 *valorAplicadoRaw = CalibFlash_GetServoPulsoMaxUs();
                 return CALIB_STATUS_APPLY_ERROR;
             }
             uint16_t nuevoValor = LeerUint16BigEndian(datos);
             bool ok = CalibFlash_SetServoPulsoMaxUs(nuevoValor);
             *valorAplicadoRaw = CalibFlash_GetServoPulsoMaxUs();
+            if (ok && CalibFlash_GetControlHabilitado() == 2U) {
+                s_objetivoManualServoUs = CalibFlash_GetServoPulsoMaxUs();
+                s_objetivoManualServoPendiente = true;
+            }
             if (ok) return CALIB_STATUS_OK;
             return s_ultimaEscrituraFallo ? CALIB_STATUS_STORAGE_ERROR : CALIB_STATUS_OUT_OF_RANGE;
         }
@@ -361,8 +438,22 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
         }
 
         case CALIB_ID_CONTROL_HABILITADO: {
-            bool ok = CalibFlash_SetControlHabilitado(datos[1] != 0U);
-            *valorAplicadoRaw = CalibFlash_GetControlHabilitado() ? 1U : 0U;
+            /* 0=desactivado, 1=barrido automático MIN<->MAX, 2=manual,
+             * 3=sintonización PID (ver CalibFlash_GetControlHabilitado()
+             * y README 4.4). */
+            bool ok = CalibFlash_SetControlHabilitado(datos[1]);
+            /* Medida de seguridad: al ENTRAR a cualquier modo de
+             * calibración (1/2/3) se limpia SET_RPM a su "sin comandar"
+             * (0.0f) -- así el operador siempre tiene que volver a pedir
+             * un setpoint explícito para esa sesión, en vez de que un
+             * SET_RPM que haya quedado de una operación anterior active
+             * el PID solo al entrar a modo 3 (en 1/2 no tiene efecto,
+             * pero se limpia igual por consistencia). No aplica al
+             * volver a 0 -- ahí no hay nada que "limpiar hacia atrás". */
+            if (ok && datos[1] != 0U) {
+                CalibFlash_SetSetRpm(0.0f);
+            }
+            *valorAplicadoRaw = (uint16_t)CalibFlash_GetControlHabilitado();
             if (ok) return CALIB_STATUS_OK;
             return s_ultimaEscrituraFallo ? CALIB_STATUS_STORAGE_ERROR : CALIB_STATUS_OUT_OF_RANGE;
         }
@@ -486,7 +577,7 @@ uint16_t CalibFlash_GetServoPulsoMinUs(void)          { return s_datos.servoPuls
 uint16_t CalibFlash_GetServoPulsoMaxUs(void)          { return s_datos.servoPulsoMaxUs; }
 uint32_t CalibFlash_GetTimeoutSinComandoS(void)       { return s_datos.timeoutSinComandoS; }
 float    CalibFlash_GetTasaMaxCambioRpmS(void)        { return s_datos.tasaMaxCambioRpmS; }
-bool     CalibFlash_GetControlHabilitado(void)        { return s_datos.controlHabilitado != 0U; }
+uint8_t  CalibFlash_GetControlHabilitado(void)         { return s_datos.controlHabilitado; }
 uint16_t CalibFlash_GetIntervaloEnvioOperativoS(void) { return s_datos.intervaloOperativoS; }
 uint16_t CalibFlash_GetIntervaloEnvioStandbyS(void)   { return s_datos.intervaloStandbyS; }
 CalibFlash_Modo_t CalibFlash_GetModo(void)            { return (CalibFlash_Modo_t)s_datos.modo; }
@@ -603,9 +694,10 @@ bool CalibFlash_SetTasaMaxCambioRpmS(float v)
     return CalibFlash_EscribirEnFlash();
 }
 
-bool CalibFlash_SetControlHabilitado(bool habilitado)
+bool CalibFlash_SetControlHabilitado(uint8_t modo)
 {
-    s_datos.controlHabilitado = habilitado ? 1U : 0U;
+    if (modo > 3U) return false; /* 0=desactivado, 1=barrido, 2=manual, 3=sintonizacion PID */
+    s_datos.controlHabilitado = modo;
     return CalibFlash_EscribirEnFlash();
 }
 
@@ -688,6 +780,21 @@ bool CalibFlash_HayResetPendiente(void)
     return s_resetPendiente;
 }
 
+bool CalibFlash_HayObjetivoManualServo(void)
+{
+    return s_objetivoManualServoPendiente;
+}
+
+uint16_t CalibFlash_GetObjetivoManualServoUs(void)
+{
+    return s_objetivoManualServoUs;
+}
+
+void CalibFlash_LimpiarObjetivoManualServo(void)
+{
+    s_objetivoManualServoPendiente = false;
+}
+
 /* ==================== FUNCIONES PRIVADAS ==================== */
 
 static uint16_t LeerUint16BigEndian(const uint8_t *datos)
@@ -736,7 +843,7 @@ static uint16_t CalibFlash_ValorActualRaw(uint8_t id)
         case CALIB_ID_TASA_MAX_CAMBIO_RPM_S:
             return CodificarUint16(CalibFlash_GetTasaMaxCambioRpmS(), 10.0f);
         case CALIB_ID_CONTROL_HABILITADO:
-            return CalibFlash_GetControlHabilitado() ? 1U : 0U;
+            return (uint16_t)CalibFlash_GetControlHabilitado();
         case CALIB_ID_INTERVALO_ENVIO_OPERATIVO_S:
             return CalibFlash_GetIntervaloEnvioOperativoS();
         case CALIB_ID_INTERVALO_ENVIO_STANDBY_S:

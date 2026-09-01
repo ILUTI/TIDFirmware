@@ -126,6 +126,20 @@ void RAK3172_Update(void);
 void RAK3172_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size);
 
 /**
+ * Debe llamarse desde el callback global HAL_UART_ErrorCallback() en
+ * main.c, cuando el error provenga de la UART del RAK3172. Sin esto,
+ * un solo error de UART (overrun/framing/ruido -- ej. si el USB-a-PC
+ * mete ruido al plano de tierra, ver hallazgos de hardware) deja al
+ * modulo sordo para siempre: HAL aborta la recepcion por DMA
+ * internamente al entrar en error y RAK3172_RxEventCallback() nunca
+ * vuelve a dispararse, aunque el RAK3172 siga contestando bien por su
+ * lado -- todo comando futuro solo expira por TIMEOUT sin que el host
+ * jamas vea la respuesta real. Limpia los flags de error y rearma la
+ * recepcion.
+ */
+void RAK3172_ErrorCallback(UART_HandleTypeDef *huart);
+
+/**
  * Envía un comando AT crudo (sin "\r\n", se agrega internamente) y
  * regresa inmediatamente -- no bloquea esperando la respuesta.
  * La respuesta se procesa de forma asíncrona; usar
@@ -225,8 +239,11 @@ bool RAK3172_EnviarAck(uint8_t id, uint8_t status, uint16_t valorRaw);
 /**
  * Pide la hora UTC a la red LoRaWAN (DeviceTimeReq de la especificación
  * LoRaWAN, vía "AT+TIMEREQ=1" en RUI3). El valor llega "montado" en el
- * próximo uplink exitoso -- no es instantáneo. Llamar una vez, después
- * de que RAK3172_EstaUnido() sea true. Ver RAK3172_HoraDeRedDisponible().
+ * próximo uplink exitoso -- no es instantáneo. Se puede llamar más de
+ * una vez por arranque (p. ej. para un resync periódico que corrija la
+ * deriva del RTC) -- cada llamada limpia el flag de
+ * RAK3172_HoraDeRedDisponible() del ciclo anterior. Requiere que
+ * RAK3172_EstaUnido() sea true.
  *
  * @return true si se pudo encolar el comando AT+TIMEREQ=1.
  */
@@ -234,7 +251,8 @@ bool RAK3172_SolicitarHoraRed(void);
 
 /**
  * true una vez que la red confirmó el envío de la hora (evento
- * "+EVT:TIMEREQ" visto tras un uplink) -- en ese punto ya se puede
+ * "+EVT:TIMEREQ" visto tras un uplink) para el ciclo de solicitud MÁS
+ * RECIENTE (ver RAK3172_SolicitarHoraRed()) -- en ese punto ya se puede
  * llamar RAK3172_ConsultarHoraRed() para leer el valor.
  */
 bool RAK3172_HoraDeRedDisponible(void);
