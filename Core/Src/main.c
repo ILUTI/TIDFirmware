@@ -30,6 +30,7 @@
 #include "gps.h"
 #include "comando_serial.h"
 #include <stdio.h>
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -40,6 +41,145 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define INTERVALO_ENVIO_RPM_MS   30000U   // mandar RPM cada 30 segundos
+
+/* Auto-calibracion de ralenti (CALIBRAR_RALENTI, ver calibracion_flash.c) --
+ * ventana total larga porque un motor frio puede arrancar bien por debajo
+ * de su ralenti real y tardar en subir (ej. ~500 -> ~800 observado en
+ * campo); de esa ventana total solo se promedian los ultimos segundos
+ * (RALENTI_CAL_VENTANA_PROMEDIO_MS), descartando la rampa de calentamiento
+ * de los primeros ~90s. RALENTI_CAL_MARGEN_RPM se suma al promedio antes de
+ * aplicarlo como RPM_MIN, para que el ruido normal de medicion (+-10-15 RPM,
+ * ver hallazgos de PID) no cruce el umbral por accidente. */
+#define RALENTI_CAL_DURACION_TOTAL_MS     120000U
+#define RALENTI_CAL_VENTANA_PROMEDIO_MS    30000U
+#define RALENTI_CAL_MARGEN_RPM                30.0f
+
+/* Auto-calibracion de SERVO_PULSO_MIN (CONTROL_HABILITADO=5) -- barre el
+ * pulso hacia arriba en pasos chicos desde el SERVO_PULSO_MIN actual,
+ * buscando donde el motor empieza a acelerar de verdad (la "zona muerta"
+ * mecanica del acelerador, observada en campo: unos grados de recorrido
+ * sin ningun efecto antes de que el motor reaccione). Parametros pensados
+ * para que el barrido sea autolimitado y de bajo riesgo -- ver README
+ * seccion 10 para el analisis de riesgo completo. */
+#define SERVOMIN_CAL_PASO_US                     8U    /* incremento por paso */
+#define SERVOMIN_CAL_TECHO_US                   180U    /* tope maximo sobre el SERVO_PULSO_MIN de entrada -- si se llega sin detectar nada, se aborta con error en vez de seguir subiendo a ciegas */
+#define SERVOMIN_CAL_DWELL_MS                  2500U    /* espera de asentamiento antes de leer la RPM en cada paso */
+#define SERVOMIN_CAL_BASELINE_MS               12000U    /* ventana para medir una linea base fresca de RPM antes de barrer */
+#define SERVOMIN_CAL_UMBRAL_DETECCION_RPM        30.0f  /* cuanto debe subir la RPM sobre la linea base para contar como "empezo a acelerar" -- mayor al ruido normal de medicion (+-10-15 RPM) */
+#define SERVOMIN_CAL_SALTO_ANORMAL_RPM  (SERVOMIN_CAL_UMBRAL_DETECCION_RPM * 4.0f) /* si un solo paso sube esto o mas, es un salto fuera de lo esperado -- abortar ya, no seguir */
+#define SERVOMIN_CAL_CONFIRMACIONES_NECESARIAS    2U    /* lecturas seguidas por encima del umbral, en el mismo pulso, antes de dar por confirmada la deteccion */
+#define SERVOMIN_CAL_MARGEN_PASOS                 6U    /* pasos de colchon hacia atras al aplicar el resultado, para no dejar SERVO_PULSO_MIN pegado justo al borde. SUBIDO de 3 a 6 (2026-09-03) tras confirmar en campo que la transicion NO siempre es un escalon limpio -- una corrida real mostro subida sostenida (14.8/7.3/26.8/26.1/27.0 RPM) durante ~6 pasos antes de confirmar deteccion, y 3 pasos de margen dejo el SERVO_PULSO_MIN resultante a mitad de esa rampa (RPM de reposo termino ~20-30 RPM por encima del relenti real). 6 pasos cubre esa rampa observada sin perjudicar el caso de transicion abrupta (el barrido original de esta misma zona muerta vino en puro ruido hasta justo antes del punto de deteccion). */
+
+/* Auto-calibracion de ALPHA -- CONTROL_HABILITADO=6 (ver
+ * calibracion_flash.c) -- mide la dispersion real de RPM_instantanea
+ * (sin filtrar) durante una ventana corta con el motor ya estable, y
+ * calcula el ALPHA necesario para que la RPM ya filtrada quede dentro
+ * de un objetivo de ruido fijo (ALPHA_CAL_OBJETIVO_DESVIACION_RPM),
+ * usando la relacion de atenuacion de un filtro EMA:
+ * alpha = 2r^2/(1+r^2), con r = objetivo/desviacion_cruda. No mueve el
+ * servo (mismo motivo que el modo 4 -- pidActivoAhora nunca es true en
+ * este modo, cae solo en la rama segura de abajo). Ver README seccion 12.
+ *
+ * CASO BORDE encontrado en campo 2026-09-03: si el ruido crudo medido
+ * ya sale por debajo/cerca del objetivo, "r" se acerca a 1 y el alpha
+ * calculado se va casi a 1.0 (practicamente sin filtro) -- una ventana
+ * de 8s puede simplemente no alcanzar a capturar alguna de las rafagas
+ * de perturbacion periodicas (~15-25s) ya conocidas en este motor, asi
+ * que "se ve limpio en la ventana" no es garantia de que no haga falta
+ * nada de suavizado. ALPHA_CAL_TECHO_ALPHA pone un techo -- nunca se
+ * aplica un alpha mas agresivo (mas cercano a 1) que ese, sin importar
+ * que tan bajo salga el ruido medido. */
+#define ALPHA_CAL_VENTANA_MS                    8000U   /* duracion total de la ventana de muestreo */
+#define ALPHA_CAL_INTERVALO_MUESTREO_MS          200U   /* cada cuanto se toma una muestra dentro de la ventana -- mismo periodo que el log PID_TEST */
+#define ALPHA_CAL_OBJETIVO_DESVIACION_RPM        10.0f  /* objetivo de ruido en la RPM YA FILTRADA -- ver discusion README seccion 12 */
+#define ALPHA_CAL_TECHO_ALPHA                     0.5f  /* nunca aplicar mas filtrado "agresivo" que esto (ver caso borde arriba) -- algo mas permisivo que el 0.35 ya validado, pero lejos de "sin filtro" */
+
+/* Mapeo de curva de ganancia -- CONTROL_HABILITADO=7 (ver
+ * calibracion_flash.c). Barre el pulso hacia arriba en pasos chicos
+ * desde SERVO_PULSO_MIN, en lazo ABIERTO (sin PID), registrando el par
+ * (pulso, RPM real) en cada paso -- a diferencia de CONTROL_HABILITADO=5
+ * (que solo busca el borde de la zona muerta), esto mapea la forma
+ * completa de la curva de ganancia en el rango de operacion real, para
+ * diagnostico/diseno de una futura correccion de gain-scheduling en el
+ * PID. Por ahora SOLO mide y loguea -- todavia no aplica ninguna
+ * correccion (ver README seccion 12 y discusion sobre la geometria del
+ * mecanismo brazo-varilla).
+ *
+ * Mismo paso de 8us que la zona muerta (no uno mas grande) a proposito:
+ * el usuario pidio explicitamente no arriesgarse a pasarse de largo del
+ * techo de RPM de un salto grande en la zona de mas ganancia -- 8us
+ * tarda mas (~3 min peor caso) pero acota mejor el salto por paso. */
+#define GANANCIA_CAL_PASO_US                       8U    /* mismo tamano que SERVOMIN_CAL, a proposito -- ver nota arriba */
+#define GANANCIA_CAL_DWELL_MS                    2500U   /* espera de asentamiento antes de leer la RPM en cada paso */
+#define GANANCIA_CAL_RPM_TECHO                  1500.0f  /* nunca pasar de esta RPM durante el barrido -- elegido por el usuario como el limite seguro de esta prueba, no el maximo del motor */
+#define GANANCIA_CAL_SALTO_ANORMAL_RPM            150.0f  /* si un solo paso sube la RPM esto o mas, frenar ya -- protege contra pasarse del techo de un salto Y detecta lecturas anormales */
+
+/* Correccion de linealizacion geometrica del mecanismo biela-manivela
+ * actual (brazo del servo + varilla rigida hacia la palanca de la
+ * bomba) -- interina, mientras se decide/arma un mecanismo definitivo
+ * (piñon-cremallera, o montaje directo del servo sobre el eje de la
+ * palanca de la bomba). Geometria real medida en campo 2026-09-03:
+ * manivela (brazo) r=5.5cm, varilla L=30cm, montada justo en el punto
+ * muerto (manivela y varilla alineadas) en SERVO_PULSO_MIN -- ver
+ * memoria del proyecto y README seccion 12 para la derivacion completa.
+ *
+ * MECANISMO_US_POR_GRADO es una constante de CALIBRACION DEL SERVO
+ * (no de la instalacion mecanica) -- asume el rango tipico 500-2500us
+ * <-> 180 grados de un servo de hobby estandar (MG996R incluido). Si
+ * se cambia de modelo de servo con otra calibracion de fabrica, hay
+ * que revisar este numero. */
+#define MECANISMO_PI                    3.14159265f
+#define MECANISMO_US_POR_GRADO          ((2500.0f - 500.0f) / 180.0f)
+
+/* Trata el pulso ya calculado por el PID (con Kp/Ki/Kd, sin tocar) como
+ * si representara linealmente una posicion x deseada entre los dos
+ * extremos reales del mecanismo (en SERVO_PULSO_MIN y SERVO_PULSO_MAX),
+ * y despeja el angulo/pulso real que efectivamente logra esa x --
+ * usando la ecuacion de posicion biela-manivela (x = r*cos(theta) +
+ * sqrt(L^2 - r^2*sin^2(theta))) y su inversa exacta (ley de cosenos
+ * aplicada al mismo triangulo: cos(theta) = (r^2+x^2-L^2)/(2*r*x)).
+ * Si la geometria cargada no es valida (r/L en cero o L<=r, sin
+ * calibrar todavia), devuelve el pulso sin corregir -- nunca rompe el
+ * control por una configuracion incompleta. */
+static uint16_t Mecanismo_CorregirPulso(uint16_t pulsoCrudo)
+{
+    float r = CalibFlash_GetMecanismoManivelaCm();
+    float L = CalibFlash_GetMecanismoVarillaCm();
+    float offsetGrados = CalibFlash_GetMecanismoOffsetGrados();
+    uint16_t pulsoMin = CalibFlash_GetServoPulsoMinUs();
+    uint16_t pulsoMax = CalibFlash_GetServoPulsoMaxUs();
+
+    if (r <= 0.0f || L <= r || pulsoMax <= pulsoMin) {
+        return pulsoCrudo;
+    }
+
+    float thetaMinRad = offsetGrados * MECANISMO_PI / 180.0f;
+    float thetaMaxGrados = offsetGrados + (float)(pulsoMax - pulsoMin) / MECANISMO_US_POR_GRADO;
+    float thetaMaxRad = thetaMaxGrados * MECANISMO_PI / 180.0f;
+
+    float xEnMin = r * cosf(thetaMinRad) + sqrtf(L * L - r * r * sinf(thetaMinRad) * sinf(thetaMinRad));
+    float xEnMax = r * cosf(thetaMaxRad) + sqrtf(L * L - r * r * sinf(thetaMaxRad) * sinf(thetaMaxRad));
+
+    float fraccion = (float)(pulsoCrudo - pulsoMin) / (float)(pulsoMax - pulsoMin);
+    if (fraccion < 0.0f) fraccion = 0.0f;
+    if (fraccion > 1.0f) fraccion = 1.0f;
+    float xDeseada = xEnMin + fraccion * (xEnMax - xEnMin);
+
+    if (xDeseada <= 0.0f) {
+        return pulsoCrudo;
+    }
+
+    float cosThetaReal = (r * r + xDeseada * xDeseada - L * L) / (2.0f * r * xDeseada);
+    if (cosThetaReal > 1.0f) cosThetaReal = 1.0f;
+    if (cosThetaReal < -1.0f) cosThetaReal = -1.0f;
+    float thetaRealGrados = acosf(cosThetaReal) * 180.0f / MECANISMO_PI;
+
+    float pulsoRealF = (float)pulsoMin + (thetaRealGrados - offsetGrados) * MECANISMO_US_POR_GRADO;
+    if (pulsoRealF < (float)pulsoMin) pulsoRealF = (float)pulsoMin;
+    if (pulsoRealF > (float)pulsoMax) pulsoRealF = (float)pulsoMax;
+
+    return (uint16_t)(pulsoRealF + 0.5f);
+}
 
 /* El RTC de este nodo corre del LSI interno (~32kHz nominal, sin cristal
  * externo -- ver hallazgos de hardware), que no esta calibrado ni
@@ -268,8 +408,24 @@ int main(void)
   {
 
 	  Tacometro_Update();
-  	  RAK3172_Update();
-  	  GPS_Update();
+
+  	  /* MEDIDA TEMPORAL DE DIAGNOSTICO (2026-09-03): en CONTROL_HABILITADO=3
+  	   * (sintonizacion de PID) se saltea RAK3172_Update()/GPS_Update() por
+  	   * completo -- se sospecha que los reintentos de join del RAK3172
+  	   * (o el modulo GPS) estan generando ruido electrico/caidas de
+  	   * voltaje que contaminan la medicion de RPM durante las pruebas de
+  	   * escalon, justo cuando se vio al RAK3172 reiniciandose solo
+  	   * (banner de arranque completo repetido) en mitad de una prueba
+  	   * con oscilacion severa. Aisla la variable para las pruebas de PID:
+  	   * si la oscilacion desaparece con esto, confirma que el problema
+  	   * era electrico, no del PID. QUITAR esta condicion (dejar
+  	   * RAK3172_Update()/GPS_Update() corriendo siempre) en cuanto se
+  	   * resuelva la causa real de los reinicios del RAK3172 -- no es una
+  	   * solucion definitiva, el nodo no puede operar en campo sin LoRa. */
+  	  if (CalibFlash_GetControlHabilitado() != 3U) {
+  		  RAK3172_Update();
+  		  GPS_Update();
+  	  }
   	  ComandoSerial_Update();
 
   	  /* Persiste la primera posicion valida del arranque en flash --
@@ -627,6 +783,171 @@ int main(void)
 
   	  uint8_t modoControl = CalibFlash_GetControlHabilitado(); /* 0=desactivado, 1=barrido, 2=manual, 3=sintonizacion PID */
 
+  	  /* Auto-calibracion de ralenti -- CONTROL_HABILITADO=4 (ver
+  	   * calibracion_flash.c: solo se puede pedir viniendo de modo 0, con
+  	   * o sin el motor operando). Mientras se esta en modo 4:
+  	   *   - si el motor no esta operando, se espera -- el servo ya
+  	   *     queda en SERVO_PULSO_MIN automaticamente (pidActivoAhora es
+  	   *     siempre false en modo 4, cae en la rama de abajo).
+  	   *   - apenas el motor arranca (o si ya estaba andando al entrar a
+  	   *     este modo), arranca la ventana de medicion.
+  	   *   - si el motor se detiene a mitad de la ventana, se aborta la
+  	   *     medicion en curso y se vuelve a esperar (sin salir de modo
+  	   *     4) -- no tiene sentido promediar con el motor parado, pero
+  	   *     tampoco hace falta reenviar el downlink si se puede
+  	   *     reintentar solo arrancando el motor de nuevo.
+  	   *   - al completar los 2 minutos, se aplica RPM_MIN y se vuelve
+  	   *     sola a modo 0 (mismo criterio que el apagado de seguridad de
+  	   *     1/2 en este mismo loop, que tambien fuerza CONTROL_HABILITADO
+  	   *     localmente sin esperar un downlink). */
+  	  {
+  		  static bool     ralentiCalEsperandoMotor = false;
+  		  static bool     ralentiCalMidiendo = false;
+  		  static uint32_t ralentiCalInicioMs = 0;
+  		  static uint32_t ralentiCalUltimoLogMs = 0;
+  		  static float    ralentiCalSuma = 0.0f;
+  		  static uint32_t ralentiCalMuestras = 0;
+
+  		  if (modoControl == 4U) {
+  			  if (!ralentiCalEsperandoMotor && !ralentiCalMidiendo) {
+  				  ralentiCalEsperandoMotor = true;
+  				  printf("RALENTI_CAL,INICIO,esperando_motor=%d\r\n", (int)!motorOperandoAhora);
+  			  }
+
+  			  if (ralentiCalEsperandoMotor && motorOperandoAhora) {
+  				  ralentiCalEsperandoMotor = false;
+  				  ralentiCalMidiendo = true;
+  				  ralentiCalInicioMs = HAL_GetTick();
+  				  ralentiCalUltimoLogMs = ralentiCalInicioMs;
+  				  ralentiCalSuma = 0.0f;
+  				  ralentiCalMuestras = 0;
+  				  printf("RALENTI_CAL,MIDIENDO,duracion_total_s=%lu,ventana_promedio_s=%lu\r\n",
+  					  (unsigned long)(RALENTI_CAL_DURACION_TOTAL_MS / 1000U),
+  					  (unsigned long)(RALENTI_CAL_VENTANA_PROMEDIO_MS / 1000U));
+  			  }
+
+  			  if (ralentiCalMidiendo) {
+  				  if (!motorOperandoAhora) {
+  					  printf("RALENTI_CAL,ABORTADO,motivo=motor_se_detuvo\r\n");
+  					  ralentiCalMidiendo = false;
+  					  ralentiCalEsperandoMotor = true;
+  				  } else {
+  					  uint32_t transcurridoMs = HAL_GetTick() - ralentiCalInicioMs;
+
+  					  if (transcurridoMs >= (RALENTI_CAL_DURACION_TOTAL_MS - RALENTI_CAL_VENTANA_PROMEDIO_MS)) {
+  						  ralentiCalSuma += Tacometro_GetRPMFiltrada();
+  						  ralentiCalMuestras++;
+  					  }
+
+  					  if (HAL_GetTick() - ralentiCalUltimoLogMs >= 5000U) {
+  						  ralentiCalUltimoLogMs = HAL_GetTick();
+  						  printf("RALENTI_CAL,PROGRESO,transcurrido_s=%lu,rpm_actual=%.1f\r\n",
+  							  (unsigned long)(transcurridoMs / 1000U), Tacometro_GetRPMFiltrada());
+  					  }
+
+  					  if (transcurridoMs >= RALENTI_CAL_DURACION_TOTAL_MS) {
+  						  if (ralentiCalMuestras > 0U) {
+  							  float promedio = ralentiCalSuma / (float)ralentiCalMuestras;
+  							  float nuevoRpmMin = promedio + RALENTI_CAL_MARGEN_RPM;
+  							  bool ok = CalibFlash_SetRpmMin(nuevoRpmMin);
+  							  printf("RALENTI_CAL,COMPLETO,promedio=%.1f,RPM_MIN_nuevo=%.1f,muestras=%lu,ok=%d\r\n",
+  								  promedio, nuevoRpmMin, (unsigned long)ralentiCalMuestras, (int)ok);
+  							  CalibFlash_ForzarReporte(); /* "ACK" por LoRa -- uplink
+  							                                 * inmediato con el reporte
+  							                                 * estandar, en vez de
+  							                                 * esperar al proximo
+  							                                 * intervalo periodico */
+  						  } else {
+  							  printf("RALENTI_CAL,ERROR,sin_muestras\r\n");
+  						  }
+  						  ralentiCalMidiendo = false;
+  						  CalibFlash_SetControlHabilitado(0U); /* vuelve sola a operacion normal */
+  					  }
+  				  }
+  			  }
+  		  } else {
+  			  ralentiCalEsperandoMotor = false;
+  			  ralentiCalMidiendo = false;
+  		  }
+  	  }
+
+  	  /* Auto-calibracion de ALPHA -- CONTROL_HABILITADO=6 (ver
+  	   * calibracion_flash.c: solo se puede pedir viniendo de modo 0, con
+  	   * o sin el motor operando). Mismo patron que el bloque de modo 4
+  	   * arriba -- espera el motor, mide, aplica, vuelve sola a modo 0. */
+  	  {
+  		  static bool     alphaCalEsperandoMotor = false;
+  		  static bool     alphaCalMidiendo = false;
+  		  static uint32_t alphaCalInicioMs = 0;
+  		  static uint32_t alphaCalUltimoMuestreoMs = 0;
+  		  static uint32_t alphaCalMuestras = 0;
+  		  static float    alphaCalMedia = 0.0f;
+  		  static float    alphaCalM2 = 0.0f; /* Welford -- evita cancelacion catastrofica al restar RPM~cientos/miles al cuadrado */
+
+  		  if (modoControl == 6U) {
+  			  if (!alphaCalEsperandoMotor && !alphaCalMidiendo) {
+  				  alphaCalEsperandoMotor = true;
+  				  printf("ALPHA_CAL,INICIO,esperando_motor=%d\r\n", (int)!motorOperandoAhora);
+  			  }
+
+  			  if (alphaCalEsperandoMotor && motorOperandoAhora) {
+  				  alphaCalEsperandoMotor = false;
+  				  alphaCalMidiendo = true;
+  				  alphaCalInicioMs = HAL_GetTick();
+  				  alphaCalUltimoMuestreoMs = alphaCalInicioMs;
+  				  alphaCalMuestras = 0U;
+  				  alphaCalMedia = 0.0f;
+  				  alphaCalM2 = 0.0f;
+  				  printf("ALPHA_CAL,MIDIENDO,duracion_s=%lu\r\n", (unsigned long)(ALPHA_CAL_VENTANA_MS / 1000U));
+  			  }
+
+  			  if (alphaCalMidiendo) {
+  				  if (!motorOperandoAhora) {
+  					  printf("ALPHA_CAL,ABORTADO,motivo=motor_se_detuvo\r\n");
+  					  alphaCalMidiendo = false;
+  					  alphaCalEsperandoMotor = true;
+  				  } else {
+  					  uint32_t transcurridoMs = HAL_GetTick() - alphaCalInicioMs;
+
+  					  if (HAL_GetTick() - alphaCalUltimoMuestreoMs >= ALPHA_CAL_INTERVALO_MUESTREO_MS) {
+  						  alphaCalUltimoMuestreoMs = HAL_GetTick();
+  						  float muestra = Tacometro_GetRPMInstantanea();
+  						  alphaCalMuestras++;
+  						  float delta = muestra - alphaCalMedia;
+  						  alphaCalMedia += delta / (float)alphaCalMuestras;
+  						  float delta2 = muestra - alphaCalMedia;
+  						  alphaCalM2 += delta * delta2;
+  					  }
+
+  					  if (transcurridoMs >= ALPHA_CAL_VENTANA_MS) {
+  						  if (alphaCalMuestras >= 2U) {
+  							  float varianza = alphaCalM2 / (float)(alphaCalMuestras - 1U);
+  							  float desviacionCruda = sqrtf(varianza);
+  							  float r = (desviacionCruda > ALPHA_CAL_OBJETIVO_DESVIACION_RPM)
+  										  ? (ALPHA_CAL_OBJETIVO_DESVIACION_RPM / desviacionCruda)
+  										  : 1.0f; /* ruido crudo ya en/por debajo del objetivo -- el techo de abajo evita que esto se traduzca en "sin filtro" */
+  							  float alphaCalculado = (2.0f * r * r) / (1.0f + r * r);
+  							  if (alphaCalculado > ALPHA_CAL_TECHO_ALPHA) {
+  								  alphaCalculado = ALPHA_CAL_TECHO_ALPHA;
+  							  }
+  							  bool ok = CalibFlash_SetAlphaFiltro(alphaCalculado);
+  							  printf("ALPHA_CAL,COMPLETO,desviacion_cruda=%.2f,alpha_nuevo=%.4f,muestras=%lu,ok=%d\r\n",
+  								  desviacionCruda, CalibFlash_GetAlphaFiltro(), (unsigned long)alphaCalMuestras, (int)ok);
+  							  CalibFlash_ForzarReporte(); /* "ACK" por LoRa, mismo criterio que ralenti/servo-min */
+  						  } else {
+  							  printf("ALPHA_CAL,ERROR,sin_muestras_suficientes\r\n");
+  						  }
+  						  alphaCalMidiendo = false;
+  						  CalibFlash_SetControlHabilitado(0U); /* vuelve sola a operacion normal */
+  					  }
+  				  }
+  			  }
+  		  } else {
+  			  alphaCalEsperandoMotor = false;
+  			  alphaCalMidiendo = false;
+  		  }
+  	  }
+
   	  static bool pidActivoAntes = false;
   	  /* Modo 3 (sintonizacion PID) usa el MISMO camino de control que el
   	   * modo 0 -- el servo lo maneja pid.c igual en ambos casos, la unica
@@ -691,6 +1012,180 @@ int main(void)
   			  CalibFlash_LimpiarObjetivoManualServo();
   		  }
   		  Servo_MoverHacia(objetivoManualServoUs);
+  	  } else if (modoControl == 5U) {
+  		  /* Calibración automática de SERVO_PULSO_MIN (umbral de
+  		   * aceleración) -- a diferencia de 1/2, SÍ mira la RPM en cada
+  		   * paso, así que puede entrar sin el motor operando y
+  		   * simplemente esperar. Estados: 1=esperando motor,
+  		   * 2=midiendo línea base fresca en el SERVO_PULSO_MIN actual,
+  		   * 3=barriendo hacia arriba en pasos chicos. Ver README
+  		   * sección 10 para el diseño completo y el análisis de riesgo. */
+  		  static uint8_t  servoMinCalEstado = 1U;
+  		  static uint32_t servoMinCalInicioEtapaMs = 0;
+  		  static float    servoMinCalSuma = 0.0f;
+  		  static uint32_t servoMinCalMuestras = 0;
+  		  static float    servoMinCalBaselineRpm = 0.0f;
+  		  static uint16_t servoMinCalPulsoBase = 0;
+  		  static uint16_t servoMinCalPulsoPaso = 0;
+  		  static uint8_t  servoMinCalConfirmaciones = 0;
+
+  		  if (modoControlAnterior != 5U) {
+  			  /* Flanco de entrada -- siempre arranca esperando el motor,
+  			   * aunque ya esté operando (el siguiente bloque lo detecta
+  			   * en la misma vuelta del loop si ya está corriendo). */
+  			  servoMinCalEstado = 1U;
+  			  printf("SERVOMIN_CAL,INICIO,esperando_motor=%d\r\n", (int)!motorOperandoAhora);
+  		  }
+
+  		  if (servoMinCalEstado == 1U && motorOperandoAhora) {
+  			  servoMinCalPulsoBase = CalibFlash_GetServoPulsoMinUs();
+  			  servoMinCalEstado = 2U;
+  			  servoMinCalInicioEtapaMs = HAL_GetTick();
+  			  servoMinCalSuma = 0.0f;
+  			  servoMinCalMuestras = 0U;
+  			  printf("SERVOMIN_CAL,BASELINE,pulso_base=%u,duracion_s=%lu\r\n",
+  				  servoMinCalPulsoBase, (unsigned long)(SERVOMIN_CAL_BASELINE_MS / 1000U));
+  		  }
+
+  		  if (servoMinCalEstado == 2U && !motorOperandoAhora) {
+  			  printf("SERVOMIN_CAL,ABORTADO,motivo=motor_se_detuvo\r\n");
+  			  servoMinCalEstado = 1U;
+  		  } else if (servoMinCalEstado == 2U) {
+  			  servoMinCalSuma += Tacometro_GetRPMFiltrada();
+  			  servoMinCalMuestras++;
+  			  if (HAL_GetTick() - servoMinCalInicioEtapaMs >= SERVOMIN_CAL_BASELINE_MS) {
+  				  servoMinCalBaselineRpm = servoMinCalSuma / (float)servoMinCalMuestras;
+  				  servoMinCalPulsoPaso = servoMinCalPulsoBase;
+  				  servoMinCalConfirmaciones = 0U;
+  				  servoMinCalEstado = 3U;
+  				  servoMinCalInicioEtapaMs = HAL_GetTick();
+  				  printf("SERVOMIN_CAL,BARRIENDO,baseline_rpm=%.1f,pulso_inicial=%u\r\n",
+  					  servoMinCalBaselineRpm, servoMinCalPulsoPaso);
+  			  }
+  		  }
+
+  		  if (servoMinCalEstado == 3U && !motorOperandoAhora) {
+  			  printf("SERVOMIN_CAL,ABORTADO,motivo=motor_se_detuvo\r\n");
+  			  servoMinCalEstado = 1U;
+  		  } else if (servoMinCalEstado == 3U &&
+  		             HAL_GetTick() - servoMinCalInicioEtapaMs >= SERVOMIN_CAL_DWELL_MS) {
+  			  float rpmActual = Tacometro_GetRPMFiltrada();
+  			  float subidaRpm = rpmActual - servoMinCalBaselineRpm;
+  			  printf("SERVOMIN_CAL,PASO,pulso=%u,rpm=%.1f,subida=%.1f,confirmaciones=%u\r\n",
+  				  servoMinCalPulsoPaso, rpmActual, subidaRpm, servoMinCalConfirmaciones);
+
+  			  if (subidaRpm >= SERVOMIN_CAL_SALTO_ANORMAL_RPM) {
+  				  /* Salto mucho mas grande de lo esperado en un solo
+  				   * paso -- frenar ya, no seguir empujando ni aplicar
+  				   * ningun resultado automatico. */
+  				  printf("SERVOMIN_CAL,ABORTADO,motivo=salto_rpm_anormal\r\n");
+  				  servoMinCalEstado = 1U;
+  				  CalibFlash_SetControlHabilitado(0U);
+  			  } else if (subidaRpm >= SERVOMIN_CAL_UMBRAL_DETECCION_RPM) {
+  				  servoMinCalConfirmaciones++;
+  				  if (servoMinCalConfirmaciones >= SERVOMIN_CAL_CONFIRMACIONES_NECESARIAS) {
+  					  uint16_t margenUs = (uint16_t)(SERVOMIN_CAL_MARGEN_PASOS * SERVOMIN_CAL_PASO_US);
+  					  uint16_t nuevoServoMin = servoMinCalPulsoBase;
+  					  if (servoMinCalPulsoPaso > (uint16_t)(servoMinCalPulsoBase + margenUs)) {
+  						  nuevoServoMin = servoMinCalPulsoPaso - margenUs;
+  					  }
+  					  bool ok = CalibFlash_SetServoPulsoMinUs(nuevoServoMin);
+  					  printf("SERVOMIN_CAL,COMPLETO,pulso_umbral=%u,SERVO_PULSO_MIN_nuevo=%u,ok=%d\r\n",
+  						  servoMinCalPulsoPaso, nuevoServoMin, (int)ok);
+  					  CalibFlash_ForzarReporte();
+  					  servoMinCalEstado = 1U;
+  					  CalibFlash_SetControlHabilitado(0U);
+  				  } else {
+  					  /* Sostener el mismo pulso un paso mas para
+  					   * confirmar antes de dar la deteccion por buena. */
+  					  servoMinCalInicioEtapaMs = HAL_GetTick();
+  				  }
+  			  } else {
+  				  servoMinCalConfirmaciones = 0U;
+  				  uint16_t siguientePulso = (uint16_t)(servoMinCalPulsoPaso + SERVOMIN_CAL_PASO_US);
+  				  if (siguientePulso > (uint16_t)(servoMinCalPulsoBase + SERVOMIN_CAL_TECHO_US)) {
+  					  printf("SERVOMIN_CAL,ERROR,motivo=techo_alcanzado_sin_deteccion\r\n");
+  					  servoMinCalEstado = 1U;
+  					  CalibFlash_SetControlHabilitado(0U);
+  				  } else {
+  					  servoMinCalPulsoPaso = siguientePulso;
+  					  servoMinCalInicioEtapaMs = HAL_GetTick();
+  				  }
+  			  }
+  		  }
+
+  		  /* El pulso real aplicado sigue siempre el estado actual: en
+  		   * SERVO_PULSO_MIN mientras se espera el motor o se mide la
+  		   * línea base, y en el pulso del paso en curso mientras se
+  		   * barre. Servo_MoverHacia() respeta SERVO_VELOCIDAD_MAX_US_S,
+  		   * así que cada paso llega rampeado, no de un salto. */
+  		  uint16_t destinoServoMinCal = (servoMinCalEstado == 3U) ? servoMinCalPulsoPaso : CalibFlash_GetServoPulsoMinUs();
+  		  Servo_MoverHacia(destinoServoMinCal);
+  	  } else if (modoControl == 7U) {
+  		  /* Mapeo de curva de ganancia -- ver definicion de las
+  		   * constantes GANANCIA_CAL_* mas arriba. Barre en lazo ABIERTO
+  		   * (sin PID) desde SERVO_PULSO_MIN, logueando (pulso, RPM) en
+  		   * cada paso, hasta GANANCIA_CAL_RPM_TECHO o SERVO_PULSO_MAX.
+  		   * Solo mide/loguea -- no aplica ninguna correccion todavia.
+  		   * Estados: 1=esperando motor, 2=barriendo. */
+  		  static uint8_t  ganCalEstado = 1U;
+  		  static uint32_t ganCalInicioEtapaMs = 0;
+  		  static uint16_t ganCalPulsoPaso = 0;
+  		  static float    ganCalRpmAnterior = 0.0f;
+
+  		  if (modoControlAnterior != 7U) {
+  			  ganCalEstado = 1U;
+  			  printf("GANANCIA_CAL,INICIO,esperando_motor=%d\r\n", (int)!motorOperandoAhora);
+  		  }
+
+  		  if (ganCalEstado == 1U && motorOperandoAhora) {
+  			  ganCalPulsoPaso = CalibFlash_GetServoPulsoMinUs();
+  			  ganCalRpmAnterior = Tacometro_GetRPMFiltrada();
+  			  ganCalEstado = 2U;
+  			  ganCalInicioEtapaMs = HAL_GetTick();
+  			  printf("GANANCIA_CAL,BARRIENDO,pulso_inicial=%u,rpm_techo=%.0f\r\n",
+  				  ganCalPulsoPaso, GANANCIA_CAL_RPM_TECHO);
+  		  }
+
+  		  if (ganCalEstado == 2U && !motorOperandoAhora) {
+  			  printf("GANANCIA_CAL,ABORTADO,motivo=motor_se_detuvo\r\n");
+  			  ganCalEstado = 1U;
+  		  } else if (ganCalEstado == 2U &&
+  		             HAL_GetTick() - ganCalInicioEtapaMs >= GANANCIA_CAL_DWELL_MS) {
+  			  float rpmActual = Tacometro_GetRPMFiltrada();
+  			  float saltoRpm = rpmActual - ganCalRpmAnterior;
+  			  printf("GANANCIA_CAL,PASO,pulso=%u,rpm=%.1f,salto=%.1f\r\n",
+  				  ganCalPulsoPaso, rpmActual, saltoRpm);
+  			  ganCalRpmAnterior = rpmActual;
+
+  			  if (saltoRpm >= GANANCIA_CAL_SALTO_ANORMAL_RPM) {
+  				  /* Protege contra pasarse del techo de RPM de un salto
+  				   * grande en la zona de mas ganancia, y detecta
+  				   * lecturas fuera de lo esperado -- frenar ya. */
+  				  printf("GANANCIA_CAL,ABORTADO,motivo=salto_rpm_anormal\r\n");
+  				  ganCalEstado = 1U;
+  				  CalibFlash_SetControlHabilitado(0U);
+  			  } else if (rpmActual >= GANANCIA_CAL_RPM_TECHO) {
+  				  printf("GANANCIA_CAL,COMPLETO,motivo=techo_rpm_alcanzado,pulso_final=%u,rpm_final=%.1f\r\n",
+  					  ganCalPulsoPaso, rpmActual);
+  				  ganCalEstado = 1U;
+  				  CalibFlash_SetControlHabilitado(0U);
+  			  } else {
+  				  uint16_t siguientePulso = (uint16_t)(ganCalPulsoPaso + GANANCIA_CAL_PASO_US);
+  				  uint16_t maximoServo = CalibFlash_GetServoPulsoMaxUs();
+  				  if (siguientePulso > maximoServo) {
+  					  printf("GANANCIA_CAL,ERROR,motivo=servo_pulso_max_alcanzado_sin_llegar_al_techo\r\n");
+  					  ganCalEstado = 1U;
+  					  CalibFlash_SetControlHabilitado(0U);
+  				  } else {
+  					  ganCalPulsoPaso = siguientePulso;
+  					  ganCalInicioEtapaMs = HAL_GetTick();
+  				  }
+  			  }
+  		  }
+
+  		  uint16_t destinoGanCal = (ganCalEstado == 2U) ? ganCalPulsoPaso : CalibFlash_GetServoPulsoMinUs();
+  		  Servo_MoverHacia(destinoGanCal);
   	  } else if (pidActivoAhora) {
   		  /* Motor operando (en modo 0 normal, o en modo 3 sintonizando
   		   * el PID -- ver arriba, mismo comportamiento del servo en
@@ -703,6 +1198,13 @@ int main(void)
   		  if (setpointRpm > rpmMax) setpointRpm = rpmMax;
 
   		  uint16_t salidaPidUs = PID_CalcularSalidaUs(setpointRpm, Tacometro_GetRPMFiltrada());
+  		  if (CalibFlash_GetMecanismoCorreccionActiva()) {
+  			  /* Corrige la no-linealidad geometrica del mecanismo
+  			   * biela-manivela actual -- ver MECANISMO_* mas arriba y
+  			   * README seccion 12. Interina, mientras se decide/arma
+  			   * un mecanismo definitivo. */
+  			  salidaPidUs = Mecanismo_CorregirPulso(salidaPidUs);
+  		  }
   		  Servo_MoverHacia(salidaPidUs);
   	  } else {
   		  /* Sin control activo: motor detenido, o motor en su ralentí

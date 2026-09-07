@@ -28,10 +28,12 @@
 
 #define CALIB_FLASH_PAGE_NUMBER   63U
 #define CALIB_FLASH_ADDRESS       0x0801F800UL
-#define CALIB_FLASH_MAGIC         0x43414C45UL  /* "CALE" -- subido desde
-                                                   * "CALD" porque se agregaron
-                                                   * ultimaLatitudConocida/
-                                                   * ultimaLongitudConocida
+#define CALIB_FLASH_MAGIC         0x43414C46UL  /* "CALF" -- subido desde
+                                                   * "CALE" porque se agregaron
+                                                   * mecanismoManivelaCm/
+                                                   * mecanismoVarillaCm/
+                                                   * mecanismoOffsetGrados/
+                                                   * mecanismoCorreccionActiva
                                                    * a CalibFlash_Datos_t. */
 
 /* ==================== VALORES POR DEFECTO ==================== */
@@ -58,12 +60,19 @@
 #define DEFAULT_HISTERESIS_MODO_S         30U
 #define DEFAULT_PRESION_OBJETIVO          40.0f
 #define DEFAULT_TASA_MAX_CAMBIO_LLENADO_S 10.0f  /* mas lenta que la normal, a proposito */
+#define DEFAULT_MECANISMO_MANIVELA_CM      5.5f  /* medido en campo 2026-09-03 en el prototipo de banco */
+#define DEFAULT_MECANISMO_VARILLA_CM      30.0f  /* idem */
+#define DEFAULT_MECANISMO_OFFSET_GRADOS    0.0f  /* 0 = manivela montada justo en el punto muerto (el caso real medido) */
+#define DEFAULT_MECANISMO_CORRECCION_ACTIVA 0U   /* apagada por defecto -- hay que cargar manivela/varilla y encenderla a proposito */
 
 /* ==================== RANGOS VÁLIDOS ==================== */
 
 #define RANGO_PULSOS_MIN         0.1f
 #define RANGO_PULSOS_MAX         200.0f
 #define RANGO_ALPHA_MAX          1.0f
+#define RANGO_MECANISMO_CM_MIN   0.1f
+#define RANGO_MECANISMO_CM_MAX  200.0f
+#define RANGO_MECANISMO_OFFSET_GRADOS_MAX 179.0f
 #define RANGO_RPM_MAX_TECHO      6000.0f
 #define RANGO_TASA_CAMBIO_MAX    2000.0f
 #define RANGO_PRESION_MAX        500.0f
@@ -87,6 +96,9 @@ typedef struct {
     float    tasaMaxCambioRpmLlenadoS; /* TASA_MAX_CAMBIO_RPM_LLENADO_S */
     float    ultimaLatitudConocida;    /* GPS, 0.0f = nunca hubo fix */
     float    ultimaLongitudConocida;   /* GPS, 0.0f = nunca hubo fix */
+    float    mecanismoManivelaCm;      /* MECANISMO_MANIVELA_CM -- radio de la manivela (brazo del servo), cm */
+    float    mecanismoVarillaCm;       /* MECANISMO_VARILLA_CM -- largo de la varilla rigida biela-manivela, cm */
+    float    mecanismoOffsetGrados;    /* MECANISMO_OFFSET_GRADOS -- angulo de la manivela en SERVO_PULSO_MIN, medido desde el punto muerto (manivela alineada con la varilla) */
 
     uint32_t timeoutSinComandoS;       /* TIMEOUT_SIN_COMANDO_S */
     uint32_t ultimaHoraUtcConocida;    /* epoch UTC, 0 = nunca sincronizado */
@@ -105,7 +117,8 @@ typedef struct {
                                          * arranca directo en modo calibracion */
     uint8_t  modo;                     /* MODO (0/1/2) */
     uint8_t  nodeId;                   /* NODE_ID */
-    uint8_t  relleno[7];               /* completa a múltiplo de 8 bytes -- ajustar si
+    uint8_t  mecanismoCorreccionActiva; /* MECANISMO_CORRECCION_ACTIVA -- 0/1, ver README seccion 12 */
+    uint8_t  relleno[2];               /* completa a múltiplo de 8 bytes -- ajustar si
                                          * CalibFlash_VerificarTamano rompe la compilación */
 } CalibFlash_Datos_t;
 
@@ -194,6 +207,10 @@ void CalibFlash_Init(void)
         s_datos.ultimaLatitudConocida    = 0.0f; /* 0.0f = nunca hubo fix GPS -- mismo
                                                      * criterio que ultimaHoraUtcConocida. */
         s_datos.ultimaLongitudConocida   = 0.0f;
+        s_datos.mecanismoManivelaCm      = DEFAULT_MECANISMO_MANIVELA_CM;
+        s_datos.mecanismoVarillaCm       = DEFAULT_MECANISMO_VARILLA_CM;
+        s_datos.mecanismoOffsetGrados    = DEFAULT_MECANISMO_OFFSET_GRADOS;
+        s_datos.mecanismoCorreccionActiva = DEFAULT_MECANISMO_CORRECCION_ACTIVA;
         s_datos.servoPulsoMinUs          = DEFAULT_SERVO_PULSO_MIN_US;
         s_datos.servoPulsoMaxUs          = DEFAULT_SERVO_PULSO_MAX_US;
         s_datos.intervaloOperativoS      = DEFAULT_INTERVALO_OPERATIVO_S;
@@ -222,7 +239,15 @@ static CalibFlash_Categoria_t CalibFlash_CategoriaDe(uint8_t id)
 {
     switch (id) {
         case CALIB_ID_SET_RATIO:
+        case CALIB_ID_SET_RATIO_AUTO:
         case CALIB_ID_ALPHA:
+        /* Geometria del mecanismo (MECANISMO_*) como CALIBRACION, mismo
+         * motivo que SET_RATIO/ALPHA -- necesitan poder ajustarse sin
+         * detener el motor mientras se afina la correccion en campo. */
+        case CALIB_ID_MECANISMO_MANIVELA_CM:
+        case CALIB_ID_MECANISMO_VARILLA_CM:
+        case CALIB_ID_MECANISMO_OFFSET_GRADOS:
+        case CALIB_ID_MECANISMO_CORRECCION_ACTIVA:
         /* PID_KP/KI/KD como CALIBRACION (no CONFIGURACION por default) --
          * misma razon que SET_RATIO/ALPHA: la sintonizacion en lazo
          * cerrado (README seccion 9, metodo Ziegler-Nichols) exige subir
@@ -237,6 +262,18 @@ static CalibFlash_Categoria_t CalibFlash_CategoriaDe(uint8_t id)
         case CALIB_ID_PID_KP:
         case CALIB_ID_PID_KI:
         case CALIB_ID_PID_KD:
+            return CALIB_CATEGORIA_CALIBRACION;
+
+        /* CONTROL_HABILITADO tambien sale del bloqueo generico de
+         * CONFIGURACION, por la misma razon que PID_KP/KI/KD arriba --
+         * los modos 3 (sintonizacion PID) y 4 (calibracion de ralenti)
+         * NECESITAN poder activarse con el motor ya operando (no tiene
+         * sentido "parar, activar, arrancar" para algo que solo sirve
+         * con el motor corriendo). El candado real para 1/2 (que SI
+         * deben exigir motor detenido, mueven el servo sin
+         * realimentacion de RPM) esta adentro del case de abajo, no en
+         * esta categoria. */
+        case CALIB_ID_CONTROL_HABILITADO:
             return CALIB_CATEGORIA_CALIBRACION;
 
         case CALIB_ID_SET_RPM:
@@ -258,7 +295,7 @@ static CalibFlash_Categoria_t CalibFlash_CategoriaDe(uint8_t id)
 }
 
 
-CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, const uint8_t *datos, uint8_t longitudDatos, bool motorOperando, uint16_t *valorAplicadoRaw)
+CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, const uint8_t *datos, uint8_t longitudDatos, bool motorOperando, float frecuenciaHzActual, uint16_t *valorAplicadoRaw)
 {
     *valorAplicadoRaw = 0U;
     s_ultimaEscrituraFallo = false;
@@ -293,10 +330,62 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
             return s_ultimaEscrituraFallo ? CALIB_STATUS_STORAGE_ERROR : CALIB_STATUS_OUT_OF_RANGE;
         }
 
+        /* SET_RATIO_AUTO: en vez de mandar el ratio ya calculado a mano
+         * (SET_RATIO de arriba), el operador manda el RPM que lee en
+         * ese instante en un tacómetro de referencia externo, y el
+         * firmware calcula el ratio el mismo a partir de su propia
+         * frecuencia actual -- misma formula que Tacometro_Update()
+         * pero despejada (ver tacometro.c:109). Requiere el motor
+         * operando con lectura valida (si no, no hay nada que calcular). */
+        case CALIB_ID_SET_RATIO_AUTO: {
+            float rpmReferencia = (float)LeerUint16BigEndian(datos) / 10.0f;
+            if (rpmReferencia <= 0.0f || frecuenciaHzActual <= 0.0f) {
+                *valorAplicadoRaw = CodificarUint16(CalibFlash_GetPulsosPorRevolucion(), 100.0f);
+                return CALIB_STATUS_OUT_OF_RANGE;
+            }
+            float ratioCalculado = (frecuenciaHzActual * 60.0f) / rpmReferencia;
+            bool ok = CalibFlash_SetPulsosPorRevolucion(ratioCalculado);
+            *valorAplicadoRaw = CodificarUint16(CalibFlash_GetPulsosPorRevolucion(), 100.0f);
+            if (ok) return CALIB_STATUS_OK;
+            return s_ultimaEscrituraFallo ? CALIB_STATUS_STORAGE_ERROR : CALIB_STATUS_OUT_OF_RANGE;
+        }
+
         case CALIB_ID_ALPHA: {
             float nuevoValor = (float)LeerUint16BigEndian(datos) / 1000.0f;
             bool ok = CalibFlash_SetAlphaFiltro(nuevoValor);
             *valorAplicadoRaw = CodificarUint16(CalibFlash_GetAlphaFiltro(), 1000.0f);
+            if (ok) return CALIB_STATUS_OK;
+            return s_ultimaEscrituraFallo ? CALIB_STATUS_STORAGE_ERROR : CALIB_STATUS_OUT_OF_RANGE;
+        }
+
+        case CALIB_ID_MECANISMO_MANIVELA_CM: {
+            float nuevoValor = (float)LeerUint16BigEndian(datos) / 100.0f;
+            bool ok = CalibFlash_SetMecanismoManivelaCm(nuevoValor);
+            *valorAplicadoRaw = CodificarUint16(CalibFlash_GetMecanismoManivelaCm(), 100.0f);
+            if (ok) return CALIB_STATUS_OK;
+            return s_ultimaEscrituraFallo ? CALIB_STATUS_STORAGE_ERROR : CALIB_STATUS_OUT_OF_RANGE;
+        }
+
+        case CALIB_ID_MECANISMO_VARILLA_CM: {
+            float nuevoValor = (float)LeerUint16BigEndian(datos) / 100.0f;
+            bool ok = CalibFlash_SetMecanismoVarillaCm(nuevoValor);
+            *valorAplicadoRaw = CodificarUint16(CalibFlash_GetMecanismoVarillaCm(), 100.0f);
+            if (ok) return CALIB_STATUS_OK;
+            return s_ultimaEscrituraFallo ? CALIB_STATUS_STORAGE_ERROR : CALIB_STATUS_OUT_OF_RANGE;
+        }
+
+        case CALIB_ID_MECANISMO_OFFSET_GRADOS: {
+            float nuevoValor = (float)LeerUint16BigEndian(datos) / 100.0f;
+            bool ok = CalibFlash_SetMecanismoOffsetGrados(nuevoValor);
+            *valorAplicadoRaw = CodificarUint16(CalibFlash_GetMecanismoOffsetGrados(), 100.0f);
+            if (ok) return CALIB_STATUS_OK;
+            return s_ultimaEscrituraFallo ? CALIB_STATUS_STORAGE_ERROR : CALIB_STATUS_OUT_OF_RANGE;
+        }
+
+        case CALIB_ID_MECANISMO_CORRECCION_ACTIVA: {
+            uint16_t nuevoValor = LeerUint16BigEndian(datos);
+            bool ok = CalibFlash_SetMecanismoCorreccionActiva((uint8_t)nuevoValor);
+            *valorAplicadoRaw = (uint16_t)CalibFlash_GetMecanismoCorreccionActiva();
             if (ok) return CALIB_STATUS_OK;
             return s_ultimaEscrituraFallo ? CALIB_STATUS_STORAGE_ERROR : CALIB_STATUS_OUT_OF_RANGE;
         }
@@ -438,19 +527,54 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
         }
 
         case CALIB_ID_CONTROL_HABILITADO: {
-            /* 0=desactivado, 1=barrido automático MIN<->MAX, 2=manual,
-             * 3=sintonización PID (ver CalibFlash_GetControlHabilitado()
-             * y README 4.4). */
-            bool ok = CalibFlash_SetControlHabilitado(datos[1]);
+            /* 0=desactivado (operacion normal / ralenti, segun SET_RPM),
+             * 1=barrido automático MIN<->MAX, 2=manual, 3=sintonización
+             * PID, 4=calibración de ralentí, 5=calibración de
+             * SERVO_PULSO_MIN (umbral de aceleración) (ver
+             * CalibFlash_GetControlHabilitado() y README 4.4).
+             *
+             * Tres grupos por seguridad: 1/2 mueven el servo directo,
+             * sin ninguna realimentación de RPM, y NO saben si el motor
+             * está operando o no -- exigen el motor detenido para
+             * entrar (chequeo explícito acá, ya que esta categoría ya
+             * no bloquea todo por defecto). 0/3/4 no cambian cómo se
+             * maneja el servo respecto a la operación normal (ver
+             * main.c) y de hecho 3/4 solo tienen sentido con el motor ya
+             * operando, así que no exigen detenerlo para entrar. 5
+             * también mueve el servo directo, pero SÍ mira la RPM en
+             * cada paso (a diferencia de 1/2) -- por eso puede permitir
+             * entrar sin el motor operando (la rutina en main.c
+             * simplemente espera a que arranque antes de mover nada). */
+            uint8_t nuevoModo = datos[1];
+            uint8_t modoActual = CalibFlash_GetControlHabilitado();
+
+            if ((nuevoModo == 1U || nuevoModo == 2U) && motorOperando) {
+                *valorAplicadoRaw = (uint16_t)modoActual;
+                return CALIB_STATUS_REJECTED_ENGINE_RUNNING;
+            }
+
+            /* Modos 4, 5, 6 y 7 solo se pueden pedir viniendo de modo 0 --
+             * no directo desde 1/2/3 (ni entre sí), para no arrancar una
+             * ventana de calibración a mitad de otra sesión. Ninguno de
+             * los cuatro exige el motor operando para ACEPTAR el downlink
+             * (a diferencia de 1/2) -- si se activa sin el motor
+             * corriendo, la rutina en main.c simplemente espera a que
+             * arranque antes de medir/mover el servo. */
+            if ((nuevoModo == 4U || nuevoModo == 5U || nuevoModo == 6U || nuevoModo == 7U) && modoActual != 0U) {
+                *valorAplicadoRaw = (uint16_t)modoActual;
+                return CALIB_STATUS_OUT_OF_RANGE;
+            }
+
+            bool ok = CalibFlash_SetControlHabilitado(nuevoModo);
             /* Medida de seguridad: al ENTRAR a cualquier modo de
-             * calibración (1/2/3) se limpia SET_RPM a su "sin comandar"
+             * calibración (1-6) se limpia SET_RPM a su "sin comandar"
              * (0.0f) -- así el operador siempre tiene que volver a pedir
              * un setpoint explícito para esa sesión, en vez de que un
              * SET_RPM que haya quedado de una operación anterior active
-             * el PID solo al entrar a modo 3 (en 1/2 no tiene efecto,
-             * pero se limpia igual por consistencia). No aplica al
-             * volver a 0 -- ahí no hay nada que "limpiar hacia atrás". */
-            if (ok && datos[1] != 0U) {
+             * el PID solo al entrar a modo 3 (en el resto no tiene efecto
+             * directo, pero se limpia igual por consistencia). No aplica
+             * al volver a 0 -- ahí no hay nada que "limpiar hacia atrás". */
+            if (ok && nuevoModo != 0U) {
                 CalibFlash_SetSetRpm(0.0f);
             }
             *valorAplicadoRaw = (uint16_t)CalibFlash_GetControlHabilitado();
@@ -557,10 +681,10 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
     }
 }
 
-bool CalibFlash_ProcesarParametro(uint8_t id, const uint8_t *datos, uint8_t longitudDatos, bool motorOperando)
+bool CalibFlash_ProcesarParametro(uint8_t id, const uint8_t *datos, uint8_t longitudDatos, bool motorOperando, float frecuenciaHzActual)
 {
     uint16_t valorAplicado;
-    CalibFlash_ProtocoloStatus_t status = CalibFlash_ProcesarParametroConEstado(id, datos, longitudDatos, motorOperando, &valorAplicado);
+    CalibFlash_ProtocoloStatus_t status = CalibFlash_ProcesarParametroConEstado(id, datos, longitudDatos, motorOperando, frecuenciaHzActual, &valorAplicado);
     return (status == CALIB_STATUS_OK);
 }
 
@@ -585,6 +709,10 @@ uint8_t  CalibFlash_GetNodeId(void)                   { return s_datos.nodeId; }
 uint16_t CalibFlash_GetHisteresisModoS(void)          { return s_datos.histeresisModoS; }
 float    CalibFlash_GetPresionObjetivo(void)          { return s_datos.presionObjetivo; }
 float    CalibFlash_GetTasaMaxCambioRpmLlenadoS(void) { return s_datos.tasaMaxCambioRpmLlenadoS; }
+float    CalibFlash_GetMecanismoManivelaCm(void)      { return s_datos.mecanismoManivelaCm; }
+float    CalibFlash_GetMecanismoVarillaCm(void)       { return s_datos.mecanismoVarillaCm; }
+float    CalibFlash_GetMecanismoOffsetGrados(void)    { return s_datos.mecanismoOffsetGrados; }
+uint8_t  CalibFlash_GetMecanismoCorreccionActiva(void) { return s_datos.mecanismoCorreccionActiva; }
 
 uint32_t CalibFlash_GetUltimaHoraUtcConocida(void)
 {
@@ -696,7 +824,12 @@ bool CalibFlash_SetTasaMaxCambioRpmS(float v)
 
 bool CalibFlash_SetControlHabilitado(uint8_t modo)
 {
-    if (modo > 3U) return false; /* 0=desactivado, 1=barrido, 2=manual, 3=sintonizacion PID */
+    if (modo > 7U) return false; /* 0=desactivado, 1=barrido, 2=manual,
+                                   * 3=sintonizacion PID, 4=calibracion
+                                   * de ralenti, 5=calibracion de
+                                   * SERVO_PULSO_MIN (umbral de
+                                   * aceleracion), 6=calibracion de ALPHA,
+                                   * 7=mapeo de curva de ganancia */
     s_datos.controlHabilitado = modo;
     return CalibFlash_EscribirEnFlash();
 }
@@ -755,6 +888,34 @@ bool CalibFlash_SetTasaMaxCambioRpmLlenadoS(float v)
     return CalibFlash_EscribirEnFlash();
 }
 
+bool CalibFlash_SetMecanismoManivelaCm(float v)
+{
+    if (v < RANGO_MECANISMO_CM_MIN || v > RANGO_MECANISMO_CM_MAX) return false;
+    s_datos.mecanismoManivelaCm = v;
+    return CalibFlash_EscribirEnFlash();
+}
+
+bool CalibFlash_SetMecanismoVarillaCm(float v)
+{
+    if (v < RANGO_MECANISMO_CM_MIN || v > RANGO_MECANISMO_CM_MAX) return false;
+    s_datos.mecanismoVarillaCm = v;
+    return CalibFlash_EscribirEnFlash();
+}
+
+bool CalibFlash_SetMecanismoOffsetGrados(float v)
+{
+    if (v < 0.0f || v > RANGO_MECANISMO_OFFSET_GRADOS_MAX) return false;
+    s_datos.mecanismoOffsetGrados = v;
+    return CalibFlash_EscribirEnFlash();
+}
+
+bool CalibFlash_SetMecanismoCorreccionActiva(uint8_t v)
+{
+    if (v > 1U) return false;
+    s_datos.mecanismoCorreccionActiva = v;
+    return CalibFlash_EscribirEnFlash();
+}
+
 /* ==================== NO PERSISTENTES ==================== */
 
 float CalibFlash_GetSetRpm(void)  { return s_setRpm; }
@@ -768,6 +929,11 @@ void  CalibFlash_SetPresion(float v) { s_presion = v; }
 bool CalibFlash_HayReporteForzado(void)
 {
     return s_reporteForzadoPendiente;
+}
+
+void CalibFlash_ForzarReporte(void)
+{
+    s_reporteForzadoPendiente = true;
 }
 
 void CalibFlash_LimpiarReporteForzado(void)
@@ -821,9 +987,18 @@ static uint16_t CalibFlash_ValorActualRaw(uint8_t id)
 {
     switch (id) {
         case CALIB_ID_SET_RATIO:
+        case CALIB_ID_SET_RATIO_AUTO:
             return CodificarUint16(CalibFlash_GetPulsosPorRevolucion(), 100.0f);
         case CALIB_ID_ALPHA:
             return CodificarUint16(CalibFlash_GetAlphaFiltro(), 1000.0f);
+        case CALIB_ID_MECANISMO_MANIVELA_CM:
+            return CodificarUint16(CalibFlash_GetMecanismoManivelaCm(), 100.0f);
+        case CALIB_ID_MECANISMO_VARILLA_CM:
+            return CodificarUint16(CalibFlash_GetMecanismoVarillaCm(), 100.0f);
+        case CALIB_ID_MECANISMO_OFFSET_GRADOS:
+            return CodificarUint16(CalibFlash_GetMecanismoOffsetGrados(), 100.0f);
+        case CALIB_ID_MECANISMO_CORRECCION_ACTIVA:
+            return (uint16_t)CalibFlash_GetMecanismoCorreccionActiva();
         case CALIB_ID_RPM_MAX:
             return CodificarUint16(CalibFlash_GetRpmMax(), 10.0f);
         case CALIB_ID_RPM_MIN:

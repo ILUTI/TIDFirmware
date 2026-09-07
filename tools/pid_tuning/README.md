@@ -29,11 +29,22 @@ pip install -r requirements.txt
    python pid_tuning.py identify --log captura_2026-08-31.log --kp 1.0
    ```
 
-3. **Buscar ganancias** (Ziegler-Nichols en lazo cerrado, sobre el
-   modelo simulado — NO oscila el motor real):
-   ```
-   python pid_tuning.py tune --K <K> --tau <tau> --L <L> --servo-min 925 --servo-max 2000
-   ```
+3. **Buscar ganancias**. Dos métodos disponibles:
+   - `tune` (Ziegler-Nichols en lazo cerrado, sobre el modelo simulado —
+     NO oscila el motor real). **Confirmado en campo (2026-09-01): en
+     plantas con tiempo muerto significativo respecto a `tau`, esto
+     tiende a dar ganancias que oscilan cerca del setpoint, sin importar
+     qué tan chico se ponga `Ki`** — probar primero `simc` si el modelo
+     identificado tiene `L` grande respecto a `tau`.
+     ```
+     python pid_tuning.py tune --K <K> --tau <tau> --L <L> --servo-min 925 --servo-max 2000
+     ```
+   - `simc` (Skogestad 2003 — alternativa pensada justo para tiempo
+     muerto alto, deja elegir qué tan conservador ser en vez de
+     perseguir la respuesta más rápida):
+     ```
+     python pid_tuning.py simc --K <K> --tau <tau> --L <L>
+     ```
 
 4. **Previsualizar** una combinación de ganancias antes de cargarla al
    motor real:
@@ -59,11 +70,13 @@ pip install -r requirements.txt
   `scipy.optimize.curve_fit` contra un modelo FOPDT explícito (ver
   README sección 9, "Dónde sí ayuda un script de Python").
 - Las ganancias de `tune` pueden salir agresivas/con sobre-impulso
-  notorio en `simulate` — es un comportamiento conocido de
-  Ziegler-Nichols con tiempo muerto relativo alto, no un error de la
-  herramienta. Si se ve muy oscilatorio en la simulación, bajar `Kp`
-  manualmente (ej. al 60-80% del sugerido) antes de probarlo en el
-  motor real.
+  notorio en `simulate` — **confirmado en el motor real (2026-09-01)**:
+  con tiempo muerto relativo alto (`L` grande respecto a `tau`, como en
+  este motor), Ziegler-Nichols oscila cerca del setpoint sin importar
+  qué tan chico se ponga `Ki`. No es un error de la herramienta ni de
+  la ganancia elegida — es una limitación del método en sí para este
+  tipo de planta. Usar `simc` en su lugar en ese caso (ver sección 3
+  del flujo arriba).
 - `pid_calcular_salida_us()` en este script es una réplica manual de
   `PID_CalcularSalidaUs()` en `Core/Src/pid.c` — si ese archivo cambia,
   actualizar esta copia también para que la simulación siga siendo

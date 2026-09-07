@@ -456,6 +456,56 @@ def cmd_tune(args):
 
 
 # ============================================================================
+# 6. SIMC (Skogestad, 2003) -- alternativa a Ziegler-Nichols pensada para
+#    plantas con tiempo muerto significativo respecto a su constante de
+#    tiempo (L/tau alto), como esta. A diferencia de Z-N (que persigue la
+#    respuesta mas rapida posible, y por eso tiende a dar ganancias con
+#    sobre-impulso justo en este tipo de planta), SIMC deja elegir a
+#    proposito que tan conservador ser via tau_c (constante de tiempo
+#    deseada del lazo cerrado) -- no hace falta oscilar nada para usarla,
+#    solo el modelo (K, tau, L) ya identificado con `identify`.
+# ============================================================================
+
+def simc_pi_gains(K, tau, L, tau_c):
+    """Formulas SIMC para PI (Skogestad 2003):
+        Kc  = (1/K) * tau / (tau_c + L)
+        Ti  = min(tau, 4*(tau_c + L))
+    tau_c mas chico (tipicamente >= L) da un lazo mas rapido pero con
+    menos margen; mas grande da un lazo mas lento pero mas robusto ante
+    un modelo de planta impreciso -- justo el control que Z-N no da."""
+    kc = (1.0 / K) * (tau / (tau_c + L))
+    ti = min(tau, 4.0 * (tau_c + L))
+    ki = kc / ti
+    return kc, ki
+
+
+def cmd_simc(args):
+    plant = PlantModel(K=args.K, tau=args.tau, L=args.L)
+
+    # Tres puntos sobre el espectro agresivo <-> conservador, todos
+    # centrados en el tiempo muerto identificado (tau_c >= L siempre,
+    # regla practica de Skogestad).
+    opciones = [
+        ("Agresivo (tau_c = L)",        plant.L),
+        ("Medio (tau_c = 2L)",          2.0 * plant.L),
+        ("Conservador (tau_c = tau)",   plant.tau),
+    ]
+
+    print(f"Modelo: K={plant.K:.6f}  tau={plant.tau:.3f}s  L={plant.L:.3f}s")
+    print()
+    for etiqueta, tau_c in opciones:
+        kc, ki = simc_pi_gains(plant.K, plant.tau, plant.L, tau_c)
+        print(f"  {etiqueta:24s} (tau_c={tau_c:.3f}s): Kp={kc:.4f}  Ki={ki:.4f}")
+    print()
+    print("A diferencia de `tune` (Ziegler-Nichols), estas ganancias NO buscan")
+    print("la respuesta mas rapida posible -- estan pensadas para no oscilar")
+    print("ni siquiera cerca del setpoint, en plantas con bastante tiempo")
+    print("muerto como esta. Empezar por la fila 'Medio' y validar con")
+    print("`simulate` antes de probar en el motor real; si simulate ya se ve")
+    print("con sobre-impulso, probar la fila 'Conservador'.")
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
@@ -487,6 +537,12 @@ def build_parser():
     p_tune.add_argument("--step-size", type=float, default=200.0, help="Tamano del escalon de SET_RPM simulado")
     p_tune.add_argument("--kp-max", type=float, default=1000.0, help="Techo de busqueda de Ku")
     p_tune.set_defaults(func=cmd_tune)
+
+    p_simc = sub.add_parser("simc", help="Ganancias PI via SIMC (Skogestad) -- alternativa a Ziegler-Nichols para plantas con bastante tiempo muerto.")
+    p_simc.add_argument("--K", type=float, required=True)
+    p_simc.add_argument("--tau", type=float, required=True)
+    p_simc.add_argument("--L", type=float, required=True)
+    p_simc.set_defaults(func=cmd_simc)
 
     p_sim = sub.add_parser("simulate", help="Previsualizar la respuesta de una combinacion de ganancias sobre el modelo.")
     p_sim.add_argument("--K", type=float, required=True)

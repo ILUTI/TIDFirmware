@@ -73,6 +73,11 @@ extern "C" {
 #define CALIB_ID_RESET_REMOTO                      22U
 #define CALIB_ID_PRESION_OBJETIVO                  23U
 #define CALIB_ID_TASA_MAX_CAMBIO_RPM_LLENADO_S     24U
+#define CALIB_ID_SET_RATIO_AUTO                   25U
+#define CALIB_ID_MECANISMO_MANIVELA_CM            26U
+#define CALIB_ID_MECANISMO_VARILLA_CM             27U
+#define CALIB_ID_MECANISMO_OFFSET_GRADOS          28U
+#define CALIB_ID_MECANISMO_CORRECCION_ACTIVA      29U
 
 /* Byte de confirmación requerido para ejecutar los comandos críticos
  * (RESTAURAR_DEFAULTS, RESET_REMOTO). Cambiar aquí si se requiere
@@ -159,6 +164,13 @@ void CalibFlash_Init(void);
  *                           !Tacometro_EstaDetenido() desde el llamador
  *                           (rak3172.c), sin que este módulo dependa
  *                           directamente de tacometro.h.
+ * @param frecuenciaHzActual Frecuencia actual del tacómetro (Hz), tal
+ *                           cual la reporta Tacometro_GetFrecuenciaHz().
+ *                           Se pasa desde el llamador por la misma razón
+ *                           que motorOperando (mantener este módulo
+ *                           desacoplado de tacometro.h). Solo la usa
+ *                           CALIB_ID_SET_RATIO_AUTO -- cualquier otro
+ *                           parámetro la ignora.
  * @param valorAplicadoRaw   [salida] valor vigente, codificado en 2 bytes.
  * @return El STATUS correspondiente.
  */
@@ -166,6 +178,7 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id,
                                                                      const uint8_t *datos,
                                                                      uint8_t longitudDatos,
                                                                      bool motorOperando,
+                                                                     float frecuenciaHzActual,
                                                                      uint16_t *valorAplicadoRaw);
 
 /**
@@ -182,12 +195,13 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id,
  * @param id             Uno de los CALIB_ID_* de arriba.
  * @param datos          Puntero a los bytes del valor (big-endian).
  * @param longitudDatos  Cantidad de bytes disponibles en 'datos'.
+ * @param frecuenciaHzActual Ver CalibFlash_ProcesarParametroConEstado().
  * @return true si el ID fue reconocido Y el valor se aplicó
  *         correctamente (rango válido, o comando con confirmación
  *         correcta). false si el ID no existe, el valor está fuera de
  *         rango, o un comando llegó sin la confirmación esperada.
  */
-bool CalibFlash_ProcesarParametro(uint8_t id, const uint8_t *datos, uint8_t longitudDatos, bool motorOperando);
+bool CalibFlash_ProcesarParametro(uint8_t id, const uint8_t *datos, uint8_t longitudDatos, bool motorOperando, float frecuenciaHzActual);
 
 /* ==================== GETTERS DE PARÁMETROS PERSISTENTES ==================== */
 
@@ -210,7 +224,13 @@ float    CalibFlash_GetTasaMaxCambioRpmS(void);
  * diferencia de 1/2 el motor SÍ puede seguir operando sin que se
  * fuerce de vuelta a 0; único modo en el que PID_KP/PID_KI/PID_KD se
  * aceptan, y activa el log de alta frecuencia "PID_TEST,..." en
- * main.c). Ver README sección 4.4/9. */
+ * main.c), 4=auto-calibración de ralentí (RPM_MIN), 5=auto-calibración
+ * de SERVO_PULSO_MIN (zona muerta del acelerador), 6=auto-calibración
+ * de ALPHA (mide el ruido real de RPM y calcula el filtro), 7=mapeo de
+ * curva de ganancia (pulso vs RPM en lazo abierto, solo mide/loguea,
+ * no aplica correccion todavia). 4/5/6/7 solo se pueden pedir viniendo
+ * de modo 0, y se auto-revierten a 0 solos al terminar. Ver README
+ * sección 4.4/9/12. */
 uint8_t  CalibFlash_GetControlHabilitado(void);
 uint16_t CalibFlash_GetIntervaloEnvioOperativoS(void);
 uint16_t CalibFlash_GetIntervaloEnvioStandbyS(void);
@@ -219,6 +239,19 @@ uint8_t  CalibFlash_GetNodeId(void);
 uint16_t CalibFlash_GetHisteresisModoS(void);
 float    CalibFlash_GetPresionObjetivo(void);
 float    CalibFlash_GetTasaMaxCambioRpmLlenadoS(void);
+
+/** Geometria del mecanismo biela-manivela actual (brazo del servo +
+ * varilla rigida), usada para la correccion de linealizacion del PID
+ * -- ver README seccion 12. mecanismoOffsetGrados es el angulo de la
+ * manivela quando el servo esta en SERVO_PULSO_MIN, medido desde el
+ * punto muerto (manivela alineada con la varilla) -- 0 si esta
+ * montada justo en el punto muerto (el caso medido en campo
+ * 2026-09-03). mecanismoCorreccionActiva (0/1) prende/apaga la
+ * correccion sin perder los valores de manivela/varilla cargados. */
+float    CalibFlash_GetMecanismoManivelaCm(void);
+float    CalibFlash_GetMecanismoVarillaCm(void);
+float    CalibFlash_GetMecanismoOffsetGrados(void);
+uint8_t  CalibFlash_GetMecanismoCorreccionActiva(void);
 
 /** Ultima hora UTC (epoch unix) confirmada por la red, persistida en
  * flash -- 0 si nunca se sincronizo todavia. Se usa como mejor
@@ -259,7 +292,7 @@ bool CalibFlash_SetServoPulsoMinUs(uint16_t nuevoValor);
 bool CalibFlash_SetServoPulsoMaxUs(uint16_t nuevoValor);
 bool CalibFlash_SetTimeoutSinComandoS(uint32_t nuevoValor);
 bool CalibFlash_SetTasaMaxCambioRpmS(float nuevoValor);
-bool CalibFlash_SetControlHabilitado(uint8_t modo); /* válido: 0, 1, 2 o 3 -- ver getter */
+bool CalibFlash_SetControlHabilitado(uint8_t modo); /* válido: 0-7 -- ver getter */
 bool CalibFlash_SetIntervaloEnvioOperativoS(uint16_t nuevoValor);
 bool CalibFlash_SetIntervaloEnvioStandbyS(uint16_t nuevoValor);
 bool CalibFlash_SetModo(CalibFlash_Modo_t nuevoModo);
@@ -267,6 +300,10 @@ bool CalibFlash_SetNodeId(uint8_t nuevoValor);
 bool CalibFlash_SetHisteresisModoS(uint16_t nuevoValor);
 bool CalibFlash_SetPresionObjetivo(float nuevoValor);
 bool CalibFlash_SetTasaMaxCambioRpmLlenadoS(float nuevoValor);
+bool CalibFlash_SetMecanismoManivelaCm(float nuevoValor);
+bool CalibFlash_SetMecanismoVarillaCm(float nuevoValor);
+bool CalibFlash_SetMecanismoOffsetGrados(float nuevoValor);
+bool CalibFlash_SetMecanismoCorreccionActiva(uint8_t nuevoValor);
 
 /* ==================== PARÁMETROS NO PERSISTENTES (solo RAM) ==================== */
 
@@ -289,12 +326,22 @@ bool CalibFlash_HayReporteForzado(void);
 void CalibFlash_LimpiarReporteForzado(void);
 
 /**
+ * Arma internamente la misma bandera que un FORZAR_REPORTE por
+ * downlink -- para que main.c pueda pedir un uplink inmediato como
+ * "ACK" de una acción propia del firmware (ej. al completar la
+ * auto-calibración de ralentí, CONTROL_HABILITADO=4) sin duplicar la
+ * lógica de armado del uplink que ya vive en el loop principal.
+ */
+void CalibFlash_ForzarReporte(void);
+
+/**
  * true si llegó un RESET_REMOTO válido (con confirmación correcta).
  * El loop principal debe consultarlo y, cuando sea seguro hacerlo
  * (ej. servo en una posición conocida/segura), ejecutar el reset
  * real (NVIC_SystemReset()).
  */
 bool CalibFlash_HayResetPendiente(void);
+
 
 /**
  * Objetivo pendiente para el modo manual de calibración del servo

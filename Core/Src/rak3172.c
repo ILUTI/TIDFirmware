@@ -610,7 +610,8 @@ static void RAK3172_ProcesarEventoDownlink(const char *linea)
 
     uint16_t valorAplicadoRaw = 0U;
     CalibFlash_ProtocoloStatus_t status = CalibFlash_ProcesarParametroConEstado(
-        idParametro, datosValor, longitudValor, motorOperando, &valorAplicadoRaw);
+        idParametro, datosValor, longitudValor, motorOperando,
+        Tacometro_GetFrecuenciaHz(), &valorAplicadoRaw);
 
     printf("Downlink ID=%u (%u bytes de valor) -> STATUS=%d, valor vigente=0x%04X\r\n",
            idParametro, longitudValor, (int)status, valorAplicadoRaw);

@@ -34,6 +34,7 @@ typedef struct {
  * cambia un parámetro en calibracion_flash.c, actualizar aquí también. */
 static const ComandoSerial_Descriptor_t TABLA[] = {
     {"SET_RATIO",                       CALIB_ID_SET_RATIO,                       TIPO_X100},
+    {"SET_RATIO_AUTO",                  CALIB_ID_SET_RATIO_AUTO,                  TIPO_X10},
     {"ALPHA",                           CALIB_ID_ALPHA,                           TIPO_X1000},
     {"SET_RPM",                         CALIB_ID_SET_RPM,                         TIPO_X10},
     {"RPM_MAX",                         CALIB_ID_RPM_MAX,                         TIPO_X10},
@@ -57,6 +58,10 @@ static const ComandoSerial_Descriptor_t TABLA[] = {
     {"RESET_REMOTO",                    CALIB_ID_RESET_REMOTO,                    TIPO_COMANDO},
     {"PRESION_OBJETIVO",                CALIB_ID_PRESION_OBJETIVO,                TIPO_X10},
     {"TASA_MAX_CAMBIO_RPM_LLENADO_S",   CALIB_ID_TASA_MAX_CAMBIO_RPM_LLENADO_S,   TIPO_X10},
+    {"MECANISMO_MANIVELA_CM",           CALIB_ID_MECANISMO_MANIVELA_CM,           TIPO_X100},
+    {"MECANISMO_VARILLA_CM",            CALIB_ID_MECANISMO_VARILLA_CM,            TIPO_X100},
+    {"MECANISMO_OFFSET_GRADOS",         CALIB_ID_MECANISMO_OFFSET_GRADOS,         TIPO_X100},
+    {"MECANISMO_CORRECCION_ACTIVA",     CALIB_ID_MECANISMO_CORRECCION_ACTIVA,     TIPO_U16_RAW},
 };
 #define TABLA_CANTIDAD (sizeof(TABLA) / sizeof(TABLA[0]))
 
@@ -164,11 +169,19 @@ static void ProcesarLinea(char *linea)
     bool motorOperando = !Tacometro_EstaDetenido();
     uint16_t valorAplicadoRaw = 0U;
     CalibFlash_ProtocoloStatus_t status = CalibFlash_ProcesarParametroConEstado(
-        desc->id, datosValor, 2U, motorOperando, &valorAplicadoRaw);
+        desc->id, datosValor, 2U, motorOperando, Tacometro_GetFrecuenciaHz(), &valorAplicadoRaw);
+
+    /* SET_RATIO_AUTO es la única entrada de la tabla donde el tipo de
+     * VALOR recibido (RPM de referencia, x10) no coincide con el tipo
+     * del valor vigente devuelto (el ratio resultante, x100 -- misma
+     * escala que SET_RATIO) -- decodificar el "vigente" siempre como
+     * x100 para este ID en particular, no con desc->tipo. */
+    ComandoSerial_Tipo_t tipoValorVigente =
+        (desc->id == CALIB_ID_SET_RATIO_AUTO) ? TIPO_X100 : desc->tipo;
 
     printf("[CMD] %s(ID=%u) <- %.3f -> STATUS=%s, valor vigente=%.3f (raw=0x%04X)\r\n",
            desc->nombre, desc->id, valor, EstadoTexto(status),
-           DecodificarValor(desc->tipo, valorAplicadoRaw), valorAplicadoRaw);
+           DecodificarValor(tipoValorVigente, valorAplicadoRaw), valorAplicadoRaw);
 }
 
 void ComandoSerial_Init(UART_HandleTypeDef *huart)
