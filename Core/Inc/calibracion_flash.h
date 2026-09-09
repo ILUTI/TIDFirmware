@@ -78,6 +78,8 @@ extern "C" {
 #define CALIB_ID_MECANISMO_VARILLA_CM             27U
 #define CALIB_ID_MECANISMO_OFFSET_GRADOS          28U
 #define CALIB_ID_MECANISMO_CORRECCION_ACTIVA      29U
+#define CALIB_ID_PRESION_GANANCIA_RPM              30U
+#define CALIB_ID_PRESION_OFFSET_RPM                31U
 
 /* Byte de confirmación requerido para ejecutar los comandos críticos
  * (RESTAURAR_DEFAULTS, RESET_REMOTO). Cambiar aquí si se requiere
@@ -108,11 +110,16 @@ typedef enum {
     CALIB_CATEGORIA_COMANDO = 3
 } CalibFlash_Categoria_t;
 
-/* Valores válidos de MODO */
+/* Valores válidos de MODO -- gobiernan de dónde sale el setpoint de RPM
+ * que usa pid.c (ver main.c, bloque "MODO: fuente del setpoint de RPM").
+ * Nombres corregidos 2026-09-07 (antes CALIB_MODO_MANUAL/AUTOMATICO/
+ * MANTENIMIENTO, que no coincidían con la terminología real del README
+ * ni de la tabla de parámetros -- mismos valores numéricos, solo se
+ * renombró el enum al conectarlo al lazo de control real). */
 typedef enum {
-    CALIB_MODO_MANUAL        = 0,
-    CALIB_MODO_AUTOMATICO    = 1,
-    CALIB_MODO_MANTENIMIENTO = 2
+    CALIB_MODO_RALENTI = 0,  /* sin control activo, sin importar SET_RPM/PRESION */
+    CALIB_MODO_LOCAL   = 1,  /* setpoint = SET_RPM (downlink directo) */
+    CALIB_MODO_REMOTO  = 2   /* setpoint = PRESION_OFFSET_RPM + PRESION_GANANCIA_RPM * PRESION */
 } CalibFlash_Modo_t;
 
 /* Códigos de STATUS del protocolo Quick-Set (ver Tabla 2 acordada con
@@ -219,18 +226,20 @@ float    CalibFlash_GetTasaMaxCambioRpmS(void);
 /** 0=desactivado, 1=modo calibración con barrido automático MIN<->MAX,
  * 2=modo calibración manual (el servo se mantiene quieto salvo que
  * llegue un downlink nuevo de SERVO_PULSO_MIN/MAX, en cuyo caso se
- * mueve directo a ese valor), 3=modo sintonización de PID (el servo se
- * maneja igual que en modo 0 -- PID normal si corresponde -- pero a
- * diferencia de 1/2 el motor SÍ puede seguir operando sin que se
- * fuerce de vuelta a 0; único modo en el que PID_KP/PID_KI/PID_KD se
- * aceptan, y activa el log de alta frecuencia "PID_TEST,..." en
- * main.c), 4=auto-calibración de ralentí (RPM_MIN), 5=auto-calibración
- * de SERVO_PULSO_MIN (zona muerta del acelerador), 6=auto-calibración
- * de ALPHA (mide el ruido real de RPM y calcula el filtro), 7=mapeo de
- * curva de ganancia (pulso vs RPM en lazo abierto, solo mide/loguea,
- * no aplica correccion todavia). 4/5/6/7 solo se pueden pedir viniendo
- * de modo 0, y se auto-revierten a 0 solos al terminar. Ver README
- * sección 4.4/9/12. */
+ * mueve directo a ese valor), 3=auto-calibración de ralentí (RPM_MIN),
+ * 4=auto-calibración de SERVO_PULSO_MIN (zona muerta del acelerador),
+ * 5=auto-calibración de ALPHA (mide el ruido real de RPM y calcula el
+ * filtro), 6=mapeo de curva de ganancia (pulso vs RPM en lazo abierto,
+ * solo mide/loguea, no aplica correccion todavia), 7=modo sintonización
+ * de PID (el servo se maneja igual que en modo 0 -- PID normal si
+ * corresponde -- pero a diferencia de 1/2 el motor SÍ puede seguir
+ * operando sin que se fuerce de vuelta a 0; único modo en el que
+ * PID_KP/PID_KI/PID_KD se aceptan, y activa el log de alta frecuencia
+ * "PID_TEST,..." en main.c). 3/4/5/6 solo se pueden pedir viniendo
+ * de modo 0, y se auto-revierten a 0 solos al terminar. Numerados en
+ * el mismo orden en que se usan durante una puesta en marcha (README
+ * sección 12): manual (1/2), auto-cals (3-6), PID al final (7). Ver
+ * README sección 4.4/9/12. */
 uint8_t  CalibFlash_GetControlHabilitado(void);
 uint16_t CalibFlash_GetIntervaloEnvioOperativoS(void);
 uint16_t CalibFlash_GetIntervaloEnvioStandbyS(void);
@@ -252,6 +261,24 @@ float    CalibFlash_GetMecanismoManivelaCm(void);
 float    CalibFlash_GetMecanismoVarillaCm(void);
 float    CalibFlash_GetMecanismoOffsetGrados(void);
 uint8_t  CalibFlash_GetMecanismoCorreccionActiva(void);
+
+/** Fórmula lineal presión->RPM para MODO_REMOTO (setpoint =
+ * PRESION_OFFSET_RPM + PRESION_GANANCIA_RPM * PRESION) -- ver main.c.
+ * Con signo (puede ser negativa) y sin ceiling estricto más allá del
+ * rango de int16: todavía no existe una relación presión->RPM conocida
+ * de antemano (depende del sistema hidráulico real), así que estos dos
+ * parámetros se calibran EN CAMPO exactamente como PID_KP/KI/KD -- solo
+ * se aceptan con CONTROL_HABILITADO=7 (ver calibracion_flash.c),
+ * mientras se observa la respuesta real de RPM contra la presión. */
+float CalibFlash_GetPresionGananciaRpm(void);
+float CalibFlash_GetPresionOffsetRpm(void);
+
+/** HAL_GetTick() del último downlink de PRESION válido (o del arranque,
+ * si nunca llegó ninguno) -- usado por el watchdog de
+ * TIMEOUT_SIN_COMANDO_S en MODO_REMOTO (ver main.c): si pasa más de ese
+ * tiempo sin una PRESION fresca, el motor cae a ralentí en vez de seguir
+ * el último valor indefinidamente. */
+uint32_t CalibFlash_GetPresionUltimoTickMs(void);
 
 /** Ultima hora UTC (epoch unix) confirmada por la red, persistida en
  * flash -- 0 si nunca se sincronizo todavia. Se usa como mejor
@@ -304,6 +331,8 @@ bool CalibFlash_SetMecanismoManivelaCm(float nuevoValor);
 bool CalibFlash_SetMecanismoVarillaCm(float nuevoValor);
 bool CalibFlash_SetMecanismoOffsetGrados(float nuevoValor);
 bool CalibFlash_SetMecanismoCorreccionActiva(uint8_t nuevoValor);
+bool CalibFlash_SetPresionGananciaRpm(float nuevoValor);
+bool CalibFlash_SetPresionOffsetRpm(float nuevoValor);
 
 /* ==================== PARÁMETROS NO PERSISTENTES (solo RAM) ==================== */
 
@@ -329,7 +358,7 @@ void CalibFlash_LimpiarReporteForzado(void);
  * Arma internamente la misma bandera que un FORZAR_REPORTE por
  * downlink -- para que main.c pueda pedir un uplink inmediato como
  * "ACK" de una acción propia del firmware (ej. al completar la
- * auto-calibración de ralentí, CONTROL_HABILITADO=4) sin duplicar la
+ * auto-calibración de ralentí, CONTROL_HABILITADO=3) sin duplicar la
  * lógica de armado del uplink que ya vive en el loop principal.
  */
 void CalibFlash_ForzarReporte(void);

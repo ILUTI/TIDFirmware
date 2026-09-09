@@ -45,7 +45,16 @@ extern "C" {
  * acelerador ante una corrección brusca del PID). Distinto de
  * TASA_MAX_CAMBIO_RPM_S (esa limita el setpoint de RPM, no el pulso
  * físico del servo). 1250 µs/s == el barrido de la prueba de banco
- * original (25µs cada 20ms). */
+ * original (25µs cada 20ms).
+ *
+ * PROBADO en 200 µs/s (2026-09-08) para ver si actuaba como filtro
+ * extra sobre correcciones bruscas/ruido de medicion -- revertido a
+ * 1250 el mismo dia: dejaba el barrido/calibracion manual (=1/=2)
+ * demasiado lento para uso practico (un ciclo completo del barrido
+ * pasaba de ~2.4s a ~9s con el rango real de ~526us), y no se llegó a
+ * confirmar ninguna mejora real sobre la oscilacion lenta observada en
+ * el PID (esa prueba se interrumpio por un reset de la calibracion en
+ * flash, no relacionado a este valor -- ver README seccion 9). */
 #define SERVO_VELOCIDAD_MAX_US_S    1250U
 
 /* Pausa en cada extremo del barrido de calibración (main.c,
@@ -107,8 +116,21 @@ uint16_t Servo_SetPulsoUs(uint16_t microsegundos);
 uint16_t Servo_MoverHacia(uint16_t destinoUs);
 
 /** Último ancho de pulso realmente aplicado (después de cualquier
- * recorte por límites). Útil para telemetría/depuración. */
+ * recorte por límites). Útil para telemetría/depuración. Esta es la
+ * convención LOGICA (comparable directo contra SERVO_PULSO_MIN/MAX) --
+ * si SERVO_SENTIDO_INVERTIDO esta activo en servo.c, el pulso FISICO
+ * que de verdad recibe el registro del timer es distinto, ver
+ * Servo_GetPulsoFisicoActualUs(). */
 uint16_t Servo_GetPulsoActualUs(void);
+
+/** Último ancho de pulso FISICO que efectivamente se escribio en el
+ * registro de comparacion del timer (__HAL_TIM_SET_COMPARE) -- si
+ * SERVO_SENTIDO_INVERTIDO esta en 0 es identico a
+ * Servo_GetPulsoActualUs(); si esta en 1, es el valor ya espejado.
+ * Agregado para depurar en campo el sentido de giro (ver SERVO_CAL en
+ * main.c) -- comparar este valor contra lo que se observa girar
+ * fisicamente en el servo. */
+uint16_t Servo_GetPulsoFisicoActualUs(void);
 
 #ifdef __cplusplus
 }

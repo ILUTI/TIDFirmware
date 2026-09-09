@@ -28,13 +28,11 @@
 
 #define CALIB_FLASH_PAGE_NUMBER   63U
 #define CALIB_FLASH_ADDRESS       0x0801F800UL
-#define CALIB_FLASH_MAGIC         0x43414C46UL  /* "CALF" -- subido desde
-                                                   * "CALE" porque se agregaron
-                                                   * mecanismoManivelaCm/
-                                                   * mecanismoVarillaCm/
-                                                   * mecanismoOffsetGrados/
-                                                   * mecanismoCorreccionActiva
-                                                   * a CalibFlash_Datos_t. */
+#define CALIB_FLASH_MAGIC         0x43414C47UL  /* "CALG" -- subido desde
+                                                   * "CALF" porque se agregaron
+                                                   * presionGananciaRpm/
+                                                   * presionOffsetRpm a
+                                                   * CalibFlash_Datos_t. */
 
 /* ==================== VALORES POR DEFECTO ==================== */
 /* Los mismos que ya tenías validados en campo para SET_RATIO/ALPHA;
@@ -55,7 +53,7 @@
 #define DEFAULT_CONTROL_HABILITADO        0U
 #define DEFAULT_INTERVALO_OPERATIVO_S     30U
 #define DEFAULT_INTERVALO_STANDBY_S       300U
-#define DEFAULT_MODO                      CALIB_MODO_MANUAL
+#define DEFAULT_MODO                      CALIB_MODO_RALENTI
 #define DEFAULT_NODE_ID                   0U
 #define DEFAULT_HISTERESIS_MODO_S         30U
 #define DEFAULT_PRESION_OBJETIVO          40.0f
@@ -64,6 +62,8 @@
 #define DEFAULT_MECANISMO_VARILLA_CM      30.0f  /* idem */
 #define DEFAULT_MECANISMO_OFFSET_GRADOS    0.0f  /* 0 = manivela montada justo en el punto muerto (el caso real medido) */
 #define DEFAULT_MECANISMO_CORRECCION_ACTIVA 0U   /* apagada por defecto -- hay que cargar manivela/varilla y encenderla a proposito */
+#define DEFAULT_PRESION_GANANCIA_RPM       0.0f  /* sin calibrar -- con ganancia 0 el setpoint de MODO_REMOTO queda en 0 (sin comandar) hasta que se sintonice, ver README */
+#define DEFAULT_PRESION_OFFSET_RPM         0.0f  /* idem */
 
 /* ==================== RANGOS VÁLIDOS ==================== */
 
@@ -76,6 +76,8 @@
 #define RANGO_RPM_MAX_TECHO      6000.0f
 #define RANGO_TASA_CAMBIO_MAX    2000.0f
 #define RANGO_PRESION_MAX        500.0f
+#define RANGO_PRESION_GANANCIA_RPM_MAX  50.0f   /* RPM por unidad de presion -- ceiling generoso, sin dato real de campo todavia (ver README) */
+#define RANGO_PRESION_OFFSET_RPM_MAX    RANGO_RPM_MAX_TECHO
 
 /* ==================== ESTRUCTURA GUARDADA EN FLASH ==================== */
 /* Debe quedar en múltiplo de 8 bytes (double word) para el
@@ -99,6 +101,8 @@ typedef struct {
     float    mecanismoManivelaCm;      /* MECANISMO_MANIVELA_CM -- radio de la manivela (brazo del servo), cm */
     float    mecanismoVarillaCm;       /* MECANISMO_VARILLA_CM -- largo de la varilla rigida biela-manivela, cm */
     float    mecanismoOffsetGrados;    /* MECANISMO_OFFSET_GRADOS -- angulo de la manivela en SERVO_PULSO_MIN, medido desde el punto muerto (manivela alineada con la varilla) */
+    float    presionGananciaRpm;       /* PRESION_GANANCIA_RPM -- ver CalibFlash_GetPresionGananciaRpm() */
+    float    presionOffsetRpm;         /* PRESION_OFFSET_RPM -- idem */
 
     uint32_t timeoutSinComandoS;       /* TIMEOUT_SIN_COMANDO_S */
     uint32_t ultimaHoraUtcConocida;    /* epoch UTC, 0 = nunca sincronizado */
@@ -135,6 +139,13 @@ static CalibFlash_Datos_t s_datos;
 /* Parámetros NO persistentes (se reciben seguido, solo RAM) */
 static float s_setRpm = 0.0f;
 static float s_presion = 0.0f;
+
+/* HAL_GetTick() del último downlink de PRESION valido -- ver
+ * CalibFlash_GetPresionUltimoTickMs(). Arranca en el tick del boot (no
+ * en 0) para que el watchdog de TIMEOUT_SIN_COMANDO_S en MODO_REMOTO
+ * cuente desde el arranque si nunca llega ninguna PRESION, en vez de
+ * pensar que ya expiro desde "tiempo epoch 0". */
+static uint32_t s_presionUltimoTickMs = 0U;
 
 /* Banderas de comandos */
 static volatile bool s_reporteForzadoPendiente = false;
@@ -211,6 +222,8 @@ void CalibFlash_Init(void)
         s_datos.mecanismoVarillaCm       = DEFAULT_MECANISMO_VARILLA_CM;
         s_datos.mecanismoOffsetGrados    = DEFAULT_MECANISMO_OFFSET_GRADOS;
         s_datos.mecanismoCorreccionActiva = DEFAULT_MECANISMO_CORRECCION_ACTIVA;
+        s_datos.presionGananciaRpm       = DEFAULT_PRESION_GANANCIA_RPM;
+        s_datos.presionOffsetRpm         = DEFAULT_PRESION_OFFSET_RPM;
         s_datos.servoPulsoMinUs          = DEFAULT_SERVO_PULSO_MIN_US;
         s_datos.servoPulsoMaxUs          = DEFAULT_SERVO_PULSO_MAX_US;
         s_datos.intervaloOperativoS      = DEFAULT_INTERVALO_OPERATIVO_S;
@@ -224,6 +237,7 @@ void CalibFlash_Init(void)
 
     s_setRpm = 0.0f;
     s_presion = 0.0f;
+    s_presionUltimoTickMs = HAL_GetTick();
     s_reporteForzadoPendiente = false;
     s_resetPendiente = false;
 }
@@ -256,17 +270,27 @@ static CalibFlash_Categoria_t CalibFlash_CategoriaDe(uint8_t id)
          * (bloqueadas con el motor operando), el procedimiento de esa
          * seccion seria irrealizable. El candado real que evita tocarlas
          * fuera de una sesion deliberada de sintonizacion NO es esta
-         * categoria -- es el gate explicito por CONTROL_HABILITADO==3
+         * categoria -- es el gate explicito por CONTROL_HABILITADO==7
          * dentro de cada case de abajo (mismo patron que
          * SERVO_PULSO_MIN/MAX con CONTROL_HABILITADO==1/2). */
         case CALIB_ID_PID_KP:
         case CALIB_ID_PID_KI:
         case CALIB_ID_PID_KD:
+        /* PRESION_GANANCIA_RPM/PRESION_OFFSET_RPM (formula lineal de
+         * MODO_REMOTO) como CALIBRACION por la MISMA razon que
+         * PID_KP/KI/KD arriba -- todavia no existe una relacion
+         * presion->RPM conocida de antemano, se calibra en campo
+         * observando la RPM real contra la presion, con el motor
+         * operando. El candado real (que exige CONTROL_HABILITADO==7,
+         * la misma sesion de sintonizacion que las ganancias del PID)
+         * esta adentro del case de abajo, no en esta categoria. */
+        case CALIB_ID_PRESION_GANANCIA_RPM:
+        case CALIB_ID_PRESION_OFFSET_RPM:
             return CALIB_CATEGORIA_CALIBRACION;
 
         /* CONTROL_HABILITADO tambien sale del bloqueo generico de
          * CONFIGURACION, por la misma razon que PID_KP/KI/KD arriba --
-         * los modos 3 (sintonizacion PID) y 4 (calibracion de ralenti)
+         * los modos 7 (sintonizacion PID) y 3 (calibracion de ralenti)
          * NECESITAN poder activarse con el motor ya operando (no tiene
          * sentido "parar, activar, arrancar" para algo que solo sirve
          * con el motor corriendo). El candado real para 1/2 (que SI
@@ -274,6 +298,20 @@ static CalibFlash_Categoria_t CalibFlash_CategoriaDe(uint8_t id)
          * realimentacion de RPM) esta adentro del case de abajo, no en
          * esta categoria. */
         case CALIB_ID_CONTROL_HABILITADO:
+        /* MODO como CALIBRACION -- INHABILITADO el bloqueo con motor
+         * operando que traia por default (2026-09-08). Antes de que
+         * MODO controlara de donde sale el setpoint (ver bloque "MODO:
+         * fuente del setpoint de RPM" en main.c), esto no importaba;
+         * ahora que si -- si cae en CONFIGURACION, cambiar de RALENTI a
+         * LOCAL/REMOTO exige parar el motor primero, lo cual es
+         * innecesariamente incomodo (encontrado en campo justo
+         * despues de migrar de un nodo que nunca habia tocado MODO,
+         * que arranco en RALENTI e ignoraba SET_RPM hasta mandar
+         * "MODO 1" -- con el motor detenido no se podia). Mismo
+         * criterio que CONTROL_HABILITADO arriba: cambiar la FUENTE del
+         * setpoint no es mas riesgoso que cambiar el setpoint mismo
+         * (SET_RPM/PRESION, ya PROCESO, siempre en caliente). */
+        case CALIB_ID_MODO:
             return CALIB_CATEGORIA_CALIBRACION;
 
         case CALIB_ID_SET_RPM:
@@ -287,7 +325,7 @@ static CalibFlash_Categoria_t CalibFlash_CategoriaDe(uint8_t id)
 
         /* Todo lo demas (RPM_MAX/MIN, SERVO_PULSO_MIN/MAX,
          * TIMEOUT_SIN_COMANDO_S, TASA_MAX_CAMBIO_*, CONTROL_HABILITADO,
-         * INTERVALO_*, MODO, NODE_ID, HISTERESIS_MODO_S,
+         * INTERVALO_*, NODE_ID, HISTERESIS_MODO_S,
          * PRESION_OBJETIVO) cae en CONFIGURACION por el default. */
         default:
             return CALIB_CATEGORIA_CONFIGURACION;
@@ -417,7 +455,7 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
         }
 
         case CALIB_ID_PID_KP: {
-            /* Escala x100. Solo se puede tocar en CONTROL_HABILITADO=3
+            /* Escala x100. Solo se puede tocar en CONTROL_HABILITADO=7
              * (modo sintonizacion PID, ver README seccion 4.4/9) -- fuera
              * de ese modo (incluida la operacion normal, =0) se rechaza
              * con APPLY_ERROR, aunque el motor este detenido. Mismo
@@ -425,7 +463,7 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
              * por medida de seguridad, cambiar las ganancias del PID
              * requiere entrar deliberadamente a sintonizar, no es algo
              * que deba poder pasar por accidente en operacion normal. */
-            if (CalibFlash_GetControlHabilitado() != 3U) {
+            if (CalibFlash_GetControlHabilitado() != 7U) {
                 *valorAplicadoRaw = CodificarInt16ComoRaw(CalibFlash_GetPidKp(), 100.0f);
                 return CALIB_STATUS_APPLY_ERROR;
             }
@@ -438,7 +476,7 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
 
         case CALIB_ID_PID_KI: {
             /* Ver nota de CALIB_ID_PID_KP. */
-            if (CalibFlash_GetControlHabilitado() != 3U) {
+            if (CalibFlash_GetControlHabilitado() != 7U) {
                 *valorAplicadoRaw = CodificarInt16ComoRaw(CalibFlash_GetPidKi(), 1000.0f);
                 return CALIB_STATUS_APPLY_ERROR;
             }
@@ -451,7 +489,7 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
 
         case CALIB_ID_PID_KD: {
             /* Ver nota de CALIB_ID_PID_KP. */
-            if (CalibFlash_GetControlHabilitado() != 3U) {
+            if (CalibFlash_GetControlHabilitado() != 7U) {
                 *valorAplicadoRaw = CodificarInt16ComoRaw(CalibFlash_GetPidKd(), 1000.0f);
                 return CALIB_STATUS_APPLY_ERROR;
             }
@@ -464,7 +502,7 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
 
         case CALIB_ID_SERVO_PULSO_MIN: {
             /* Solo se puede recalibrar el rango del servo en modo
-             * calibracion (CONTROL_HABILITADO=1 o =2, NO 3 -- ese es
+             * calibracion (CONTROL_HABILITADO=1 o =2, NO 7 -- ese es
              * sintonizacion de PID, no recalibracion mecanica del servo)
              * -- ademas del bloqueo general de CONFIGURACION con el motor
              * operando (arriba), esto evita que un downlink suelto
@@ -528,19 +566,23 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
 
         case CALIB_ID_CONTROL_HABILITADO: {
             /* 0=desactivado (operacion normal / ralenti, segun SET_RPM),
-             * 1=barrido automático MIN<->MAX, 2=manual, 3=sintonización
-             * PID, 4=calibración de ralentí, 5=calibración de
-             * SERVO_PULSO_MIN (umbral de aceleración) (ver
-             * CalibFlash_GetControlHabilitado() y README 4.4).
+             * 1=barrido automático MIN<->MAX, 2=manual, 3=calibración
+             * de ralentí, 4=calibración de SERVO_PULSO_MIN (umbral de
+             * aceleración), 5=calibración de ALPHA, 6=mapeo de curva de
+             * ganancia, 7=sintonización PID (ver
+             * CalibFlash_GetControlHabilitado() y README 4.4). Numerados
+             * en el mismo orden en que se usan en una puesta en marcha
+             * (ver README sección 12): manual primero, auto-cals en 3-6,
+             * PID al final en 7.
              *
              * Tres grupos por seguridad: 1/2 mueven el servo directo,
              * sin ninguna realimentación de RPM, y NO saben si el motor
              * está operando o no -- exigen el motor detenido para
              * entrar (chequeo explícito acá, ya que esta categoría ya
-             * no bloquea todo por defecto). 0/3/4 no cambian cómo se
+             * no bloquea todo por defecto). 0/7/3 no cambian cómo se
              * maneja el servo respecto a la operación normal (ver
-             * main.c) y de hecho 3/4 solo tienen sentido con el motor ya
-             * operando, así que no exigen detenerlo para entrar. 5
+             * main.c) y de hecho 7/3 solo tienen sentido con el motor ya
+             * operando, así que no exigen detenerlo para entrar. 4
              * también mueve el servo directo, pero SÍ mira la RPM en
              * cada paso (a diferencia de 1/2) -- por eso puede permitir
              * entrar sin el motor operando (la rutina en main.c
@@ -553,25 +595,25 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
                 return CALIB_STATUS_REJECTED_ENGINE_RUNNING;
             }
 
-            /* Modos 4, 5, 6 y 7 solo se pueden pedir viniendo de modo 0 --
-             * no directo desde 1/2/3 (ni entre sí), para no arrancar una
+            /* Modos 3, 4, 5 y 6 solo se pueden pedir viniendo de modo 0 --
+             * no directo desde 1/2/7 (ni entre sí), para no arrancar una
              * ventana de calibración a mitad de otra sesión. Ninguno de
              * los cuatro exige el motor operando para ACEPTAR el downlink
              * (a diferencia de 1/2) -- si se activa sin el motor
              * corriendo, la rutina en main.c simplemente espera a que
              * arranque antes de medir/mover el servo. */
-            if ((nuevoModo == 4U || nuevoModo == 5U || nuevoModo == 6U || nuevoModo == 7U) && modoActual != 0U) {
+            if ((nuevoModo == 3U || nuevoModo == 4U || nuevoModo == 5U || nuevoModo == 6U) && modoActual != 0U) {
                 *valorAplicadoRaw = (uint16_t)modoActual;
                 return CALIB_STATUS_OUT_OF_RANGE;
             }
 
             bool ok = CalibFlash_SetControlHabilitado(nuevoModo);
             /* Medida de seguridad: al ENTRAR a cualquier modo de
-             * calibración (1-6) se limpia SET_RPM a su "sin comandar"
+             * calibración (1-7) se limpia SET_RPM a su "sin comandar"
              * (0.0f) -- así el operador siempre tiene que volver a pedir
              * un setpoint explícito para esa sesión, en vez de que un
              * SET_RPM que haya quedado de una operación anterior active
-             * el PID solo al entrar a modo 3 (en el resto no tiene efecto
+             * el PID solo al entrar a modo 7 (en el resto no tiene efecto
              * directo, pero se limpia igual por consistencia). No aplica
              * al volver a 0 -- ahí no hay nada que "limpiar hacia atrás". */
             if (ok && nuevoModo != 0U) {
@@ -608,8 +650,45 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
         case CALIB_ID_PRESION: {
             float nuevoValor = (float)LeerUint16BigEndian(datos) / 10.0f;
             CalibFlash_SetPresion(nuevoValor);
+            /* Marca esta PRESION como "fresca" -- consumido por el
+             * watchdog de TIMEOUT_SIN_COMANDO_S en MODO_REMOTO (ver
+             * main.c). Se actualiza aca (no en CalibFlash_SetPresion())
+             * para que solo cuente como "info fresca del aspersor" un
+             * downlink/comando real de PRESION, no cualquier llamada
+             * interna al setter. */
+            s_presionUltimoTickMs = HAL_GetTick();
             *valorAplicadoRaw = CodificarUint16(CalibFlash_GetPresion(), 10.0f);
             return CALIB_STATUS_OK;
+        }
+
+        case CALIB_ID_PRESION_GANANCIA_RPM: {
+            /* Escala x100, con signo. Ver nota de CALIB_ID_PID_KP --
+             * mismo patron exacto: solo se acepta en CONTROL_HABILITADO=7
+             * (sesion deliberada de sintonizacion), fuera de ese modo se
+             * rechaza con APPLY_ERROR aunque el motor este detenido. */
+            if (CalibFlash_GetControlHabilitado() != 7U) {
+                *valorAplicadoRaw = CodificarInt16ComoRaw(CalibFlash_GetPresionGananciaRpm(), 100.0f);
+                return CALIB_STATUS_APPLY_ERROR;
+            }
+            float nuevoValor = (float)LeerInt16BigEndian(datos) / 100.0f;
+            bool ok = CalibFlash_SetPresionGananciaRpm(nuevoValor);
+            *valorAplicadoRaw = CodificarInt16ComoRaw(CalibFlash_GetPresionGananciaRpm(), 100.0f);
+            if (ok) return CALIB_STATUS_OK;
+            return s_ultimaEscrituraFallo ? CALIB_STATUS_STORAGE_ERROR : CALIB_STATUS_OUT_OF_RANGE;
+        }
+
+        case CALIB_ID_PRESION_OFFSET_RPM: {
+            /* Escala x10, sin signo (mismo estilo que SET_RPM/RPM_MIN).
+             * Ver nota de CALIB_ID_PRESION_GANANCIA_RPM -- mismo gate. */
+            if (CalibFlash_GetControlHabilitado() != 7U) {
+                *valorAplicadoRaw = CodificarUint16(CalibFlash_GetPresionOffsetRpm(), 10.0f);
+                return CALIB_STATUS_APPLY_ERROR;
+            }
+            float nuevoValor = (float)LeerUint16BigEndian(datos) / 10.0f;
+            bool ok = CalibFlash_SetPresionOffsetRpm(nuevoValor);
+            *valorAplicadoRaw = CodificarUint16(CalibFlash_GetPresionOffsetRpm(), 10.0f);
+            if (ok) return CALIB_STATUS_OK;
+            return s_ultimaEscrituraFallo ? CALIB_STATUS_STORAGE_ERROR : CALIB_STATUS_OUT_OF_RANGE;
         }
 
         case CALIB_ID_NODE_ID: {
@@ -713,6 +792,9 @@ float    CalibFlash_GetMecanismoManivelaCm(void)      { return s_datos.mecanismo
 float    CalibFlash_GetMecanismoVarillaCm(void)       { return s_datos.mecanismoVarillaCm; }
 float    CalibFlash_GetMecanismoOffsetGrados(void)    { return s_datos.mecanismoOffsetGrados; }
 uint8_t  CalibFlash_GetMecanismoCorreccionActiva(void) { return s_datos.mecanismoCorreccionActiva; }
+float    CalibFlash_GetPresionGananciaRpm(void)       { return s_datos.presionGananciaRpm; }
+float    CalibFlash_GetPresionOffsetRpm(void)         { return s_datos.presionOffsetRpm; }
+uint32_t CalibFlash_GetPresionUltimoTickMs(void)      { return s_presionUltimoTickMs; }
 
 uint32_t CalibFlash_GetUltimaHoraUtcConocida(void)
 {
@@ -825,11 +907,11 @@ bool CalibFlash_SetTasaMaxCambioRpmS(float v)
 bool CalibFlash_SetControlHabilitado(uint8_t modo)
 {
     if (modo > 7U) return false; /* 0=desactivado, 1=barrido, 2=manual,
-                                   * 3=sintonizacion PID, 4=calibracion
-                                   * de ralenti, 5=calibracion de
-                                   * SERVO_PULSO_MIN (umbral de
-                                   * aceleracion), 6=calibracion de ALPHA,
-                                   * 7=mapeo de curva de ganancia */
+                                   * 3=calibracion de ralenti, 4=calibracion
+                                   * de SERVO_PULSO_MIN (umbral de
+                                   * aceleracion), 5=calibracion de ALPHA,
+                                   * 6=mapeo de curva de ganancia,
+                                   * 7=sintonizacion PID */
     s_datos.controlHabilitado = modo;
     return CalibFlash_EscribirEnFlash();
 }
@@ -850,7 +932,7 @@ bool CalibFlash_SetIntervaloEnvioStandbyS(uint16_t v)
 
 bool CalibFlash_SetModo(CalibFlash_Modo_t v)
 {
-    if (v != CALIB_MODO_MANUAL && v != CALIB_MODO_AUTOMATICO && v != CALIB_MODO_MANTENIMIENTO) {
+    if (v != CALIB_MODO_RALENTI && v != CALIB_MODO_LOCAL && v != CALIB_MODO_REMOTO) {
         return false;
     }
     s_datos.modo = (uint8_t)v;
@@ -913,6 +995,20 @@ bool CalibFlash_SetMecanismoCorreccionActiva(uint8_t v)
 {
     if (v > 1U) return false;
     s_datos.mecanismoCorreccionActiva = v;
+    return CalibFlash_EscribirEnFlash();
+}
+
+bool CalibFlash_SetPresionGananciaRpm(float v)
+{
+    if (v < -RANGO_PRESION_GANANCIA_RPM_MAX || v > RANGO_PRESION_GANANCIA_RPM_MAX) return false;
+    s_datos.presionGananciaRpm = v;
+    return CalibFlash_EscribirEnFlash();
+}
+
+bool CalibFlash_SetPresionOffsetRpm(float v)
+{
+    if (v < 0.0f || v > RANGO_PRESION_OFFSET_RPM_MAX) return false;
+    s_datos.presionOffsetRpm = v;
     return CalibFlash_EscribirEnFlash();
 }
 
@@ -1033,6 +1129,10 @@ static uint16_t CalibFlash_ValorActualRaw(uint8_t id)
             return CodificarUint16(CalibFlash_GetPresionObjetivo(), 10.0f);
         case CALIB_ID_TASA_MAX_CAMBIO_RPM_LLENADO_S:
             return CodificarUint16(CalibFlash_GetTasaMaxCambioRpmLlenadoS(), 10.0f);
+        case CALIB_ID_PRESION_GANANCIA_RPM:
+            return CodificarInt16ComoRaw(CalibFlash_GetPresionGananciaRpm(), 100.0f);
+        case CALIB_ID_PRESION_OFFSET_RPM:
+            return CodificarUint16(CalibFlash_GetPresionOffsetRpm(), 10.0f);
         default:
             return 0U;
     }

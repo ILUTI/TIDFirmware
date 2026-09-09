@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python pid_tuning.py simulate --K 6.3 --tau 0.43 --L 0.15 --kp 0.0676 --ki 0.1572 --servo-min 1124 --servo-max 1650 --sp-before 1050 --step-size 250)"
+    ]
+  }
+}
