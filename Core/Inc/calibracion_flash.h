@@ -74,12 +74,16 @@ extern "C" {
 #define CALIB_ID_PRESION_OBJETIVO                  23U
 #define CALIB_ID_TASA_MAX_CAMBIO_RPM_LLENADO_S     24U
 #define CALIB_ID_SET_RATIO_AUTO                   25U
-#define CALIB_ID_MECANISMO_MANIVELA_CM            26U
-#define CALIB_ID_MECANISMO_VARILLA_CM             27U
-#define CALIB_ID_MECANISMO_OFFSET_GRADOS          28U
-#define CALIB_ID_MECANISMO_CORRECCION_ACTIVA      29U
-#define CALIB_ID_PRESION_GANANCIA_RPM              30U
-#define CALIB_ID_PRESION_OFFSET_RPM                31U
+/* IDs 26-29 quedaron libres al quitar la correccion geometrica del
+ * mecanismo biela-manivela (MECANISMO_MANIVELA_CM/VARILLA_CM/
+ * OFFSET_GRADOS/CORRECCION_ACTIVA, 2026-09-11, branch servo-directo --
+ * ver README seccion 12). PRESION_GANANCIA_RPM/OFFSET_RPM (antes 30/31)
+ * se corrieron a 26/27 para ocupar ese hueco -- 28-29 siguen libres.
+ * NO reasignar sin revisar que ningun nodo viejo en campo siga
+ * mandando los IDs originales (26-29 con el significado viejo, o
+ * 30/31 con el significado de presion). */
+#define CALIB_ID_PRESION_GANANCIA_RPM              26U
+#define CALIB_ID_PRESION_OFFSET_RPM                27U
 
 /* Byte de confirmación requerido para ejecutar los comandos críticos
  * (RESTAURAR_DEFAULTS, RESET_REMOTO). Cambiar aquí si se requiere
@@ -249,19 +253,6 @@ uint16_t CalibFlash_GetHisteresisModoS(void);
 float    CalibFlash_GetPresionObjetivo(void);
 float    CalibFlash_GetTasaMaxCambioRpmLlenadoS(void);
 
-/** Geometria del mecanismo biela-manivela actual (brazo del servo +
- * varilla rigida), usada para la correccion de linealizacion del PID
- * -- ver README seccion 12. mecanismoOffsetGrados es el angulo de la
- * manivela quando el servo esta en SERVO_PULSO_MIN, medido desde el
- * punto muerto (manivela alineada con la varilla) -- 0 si esta
- * montada justo en el punto muerto (el caso medido en campo
- * 2026-09-03). mecanismoCorreccionActiva (0/1) prende/apaga la
- * correccion sin perder los valores de manivela/varilla cargados. */
-float    CalibFlash_GetMecanismoManivelaCm(void);
-float    CalibFlash_GetMecanismoVarillaCm(void);
-float    CalibFlash_GetMecanismoOffsetGrados(void);
-uint8_t  CalibFlash_GetMecanismoCorreccionActiva(void);
-
 /** Fórmula lineal presión->RPM para MODO_REMOTO (setpoint =
  * PRESION_OFFSET_RPM + PRESION_GANANCIA_RPM * PRESION) -- ver main.c.
  * Con signo (puede ser negativa) y sin ceiling estricto más allá del
@@ -327,10 +318,6 @@ bool CalibFlash_SetNodeId(uint8_t nuevoValor);
 bool CalibFlash_SetHisteresisModoS(uint16_t nuevoValor);
 bool CalibFlash_SetPresionObjetivo(float nuevoValor);
 bool CalibFlash_SetTasaMaxCambioRpmLlenadoS(float nuevoValor);
-bool CalibFlash_SetMecanismoManivelaCm(float nuevoValor);
-bool CalibFlash_SetMecanismoVarillaCm(float nuevoValor);
-bool CalibFlash_SetMecanismoOffsetGrados(float nuevoValor);
-bool CalibFlash_SetMecanismoCorreccionActiva(uint8_t nuevoValor);
 bool CalibFlash_SetPresionGananciaRpm(float nuevoValor);
 bool CalibFlash_SetPresionOffsetRpm(float nuevoValor);
 

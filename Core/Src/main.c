@@ -115,72 +115,6 @@
 #define GANANCIA_CAL_RPM_TECHO                  1500.0f  /* nunca pasar de esta RPM durante el barrido -- elegido por el usuario como el limite seguro de esta prueba, no el maximo del motor */
 #define GANANCIA_CAL_SALTO_ANORMAL_RPM            150.0f  /* si un solo paso sube la RPM esto o mas, frenar ya -- protege contra pasarse del techo de un salto Y detecta lecturas anormales */
 
-/* Correccion de linealizacion geometrica del mecanismo biela-manivela
- * actual (brazo del servo + varilla rigida hacia la palanca de la
- * bomba) -- interina, mientras se decide/arma un mecanismo definitivo
- * (piñon-cremallera, o montaje directo del servo sobre el eje de la
- * palanca de la bomba). Geometria real medida en campo 2026-09-03:
- * manivela (brazo) r=5.5cm, varilla L=30cm, montada justo en el punto
- * muerto (manivela y varilla alineadas) en SERVO_PULSO_MIN -- ver
- * memoria del proyecto y README seccion 12 para la derivacion completa.
- *
- * MECANISMO_US_POR_GRADO es una constante de CALIBRACION DEL SERVO
- * (no de la instalacion mecanica) -- asume el rango tipico 500-2500us
- * <-> 180 grados de un servo de hobby estandar (MG996R incluido). Si
- * se cambia de modelo de servo con otra calibracion de fabrica, hay
- * que revisar este numero. */
-#define MECANISMO_PI                    3.14159265f
-#define MECANISMO_US_POR_GRADO          ((2500.0f - 500.0f) / 180.0f)
-
-/* Trata el pulso ya calculado por el PID (con Kp/Ki/Kd, sin tocar) como
- * si representara linealmente una posicion x deseada entre los dos
- * extremos reales del mecanismo (en SERVO_PULSO_MIN y SERVO_PULSO_MAX),
- * y despeja el angulo/pulso real que efectivamente logra esa x --
- * usando la ecuacion de posicion biela-manivela (x = r*cos(theta) +
- * sqrt(L^2 - r^2*sin^2(theta))) y su inversa exacta (ley de cosenos
- * aplicada al mismo triangulo: cos(theta) = (r^2+x^2-L^2)/(2*r*x)).
- * Si la geometria cargada no es valida (r/L en cero o L<=r, sin
- * calibrar todavia), devuelve el pulso sin corregir -- nunca rompe el
- * control por una configuracion incompleta. */
-static uint16_t Mecanismo_CorregirPulso(uint16_t pulsoCrudo)
-{
-    float r = CalibFlash_GetMecanismoManivelaCm();
-    float L = CalibFlash_GetMecanismoVarillaCm();
-    float offsetGrados = CalibFlash_GetMecanismoOffsetGrados();
-    uint16_t pulsoMin = CalibFlash_GetServoPulsoMinUs();
-    uint16_t pulsoMax = CalibFlash_GetServoPulsoMaxUs();
-
-    if (r <= 0.0f || L <= r || pulsoMax <= pulsoMin) {
-        return pulsoCrudo;
-    }
-
-    float thetaMinRad = offsetGrados * MECANISMO_PI / 180.0f;
-    float thetaMaxGrados = offsetGrados + (float)(pulsoMax - pulsoMin) / MECANISMO_US_POR_GRADO;
-    float thetaMaxRad = thetaMaxGrados * MECANISMO_PI / 180.0f;
-
-    float xEnMin = r * cosf(thetaMinRad) + sqrtf(L * L - r * r * sinf(thetaMinRad) * sinf(thetaMinRad));
-    float xEnMax = r * cosf(thetaMaxRad) + sqrtf(L * L - r * r * sinf(thetaMaxRad) * sinf(thetaMaxRad));
-
-    float fraccion = (float)(pulsoCrudo - pulsoMin) / (float)(pulsoMax - pulsoMin);
-    if (fraccion < 0.0f) fraccion = 0.0f;
-    if (fraccion > 1.0f) fraccion = 1.0f;
-    float xDeseada = xEnMin + fraccion * (xEnMax - xEnMin);
-
-    if (xDeseada <= 0.0f) {
-        return pulsoCrudo;
-    }
-
-    float cosThetaReal = (r * r + xDeseada * xDeseada - L * L) / (2.0f * r * xDeseada);
-    if (cosThetaReal > 1.0f) cosThetaReal = 1.0f;
-    if (cosThetaReal < -1.0f) cosThetaReal = -1.0f;
-    float thetaRealGrados = acosf(cosThetaReal) * 180.0f / MECANISMO_PI;
-
-    float pulsoRealF = (float)pulsoMin + (thetaRealGrados - offsetGrados) * MECANISMO_US_POR_GRADO;
-    if (pulsoRealF < (float)pulsoMin) pulsoRealF = (float)pulsoMin;
-    if (pulsoRealF > (float)pulsoMax) pulsoRealF = (float)pulsoMax;
-
-    return (uint16_t)(pulsoRealF + 0.5f);
-}
 
 /* El RTC de este nodo corre del LSI interno (~32kHz nominal, sin cristal
  * externo -- ver hallazgos de hardware), que no esta calibrado ni
@@ -1319,13 +1253,6 @@ int main(void)
   		  if (setpointRpm > rpmMax) setpointRpm = rpmMax;
 
   		  uint16_t salidaPidUs = PID_CalcularSalidaUs(setpointRpm, Tacometro_GetRPMFiltrada());
-  		  if (CalibFlash_GetMecanismoCorreccionActiva()) {
-  			  /* Corrige la no-linealidad geometrica del mecanismo
-  			   * biela-manivela actual -- ver MECANISMO_* mas arriba y
-  			   * README seccion 12. Interina, mientras se decide/arma
-  			   * un mecanismo definitivo. */
-  			  salidaPidUs = Mecanismo_CorregirPulso(salidaPidUs);
-  		  }
   		  Servo_MoverHacia(salidaPidUs);
   	  } else {
   		  /* Sin control activo: motor detenido, o motor en su ralentí

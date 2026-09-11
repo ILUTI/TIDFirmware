@@ -25,8 +25,7 @@
  *
  * En 1, se invierte el pulso fisico que efectivamente recibe el PWM,
  * como si fuera el interruptor de "reverse" de un servo de RC -- se
- * espeja sobre el rango FIJO de fabrica del servo (500-2500us, mismos
- * limites que asume MECANISMO_US_POR_GRADO en main.c), NO sobre
+ * espeja sobre el rango FIJO de fabrica del servo (500-2500us), NO sobre
  * SERVO_PULSO_MIN/MAX. A proposito: esos dos son justamente los
  * valores que se estan calibrando a mano en CONTROL_HABILITADO=2 en el
  * mecanismo nuevo -- si el espejo se hiciera sobre ellos, el pulso que

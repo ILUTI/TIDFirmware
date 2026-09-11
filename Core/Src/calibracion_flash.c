@@ -28,11 +28,17 @@
 
 #define CALIB_FLASH_PAGE_NUMBER   63U
 #define CALIB_FLASH_ADDRESS       0x0801F800UL
-#define CALIB_FLASH_MAGIC         0x43414C47UL  /* "CALG" -- subido desde
-                                                   * "CALF" porque se agregaron
-                                                   * presionGananciaRpm/
-                                                   * presionOffsetRpm a
-                                                   * CalibFlash_Datos_t. */
+#define CALIB_FLASH_MAGIC         0x43414C48UL  /* "CALH" -- subido desde
+                                                   * "CALG" porque se quitaron
+                                                   * mecanismoManivelaCm/
+                                                   * mecanismoVarillaCm/
+                                                   * mecanismoOffsetGrados/
+                                                   * mecanismoCorreccionActiva
+                                                   * de CalibFlash_Datos_t
+                                                   * (2026-09-11, se quito la
+                                                   * correccion geometrica del
+                                                   * mecanismo biela-manivela --
+                                                   * ver README seccion 12). */
 
 /* ==================== VALORES POR DEFECTO ==================== */
 /* Los mismos que ya tenías validados en campo para SET_RATIO/ALPHA;
@@ -64,10 +70,6 @@
 #define DEFAULT_HISTERESIS_MODO_S         30U
 #define DEFAULT_PRESION_OBJETIVO          40.0f
 #define DEFAULT_TASA_MAX_CAMBIO_LLENADO_S 10.0f  /* mas lenta que la normal, a proposito */
-#define DEFAULT_MECANISMO_MANIVELA_CM      5.5f  /* medido en campo 2026-09-03 en el prototipo de banco */
-#define DEFAULT_MECANISMO_VARILLA_CM      30.0f  /* idem */
-#define DEFAULT_MECANISMO_OFFSET_GRADOS    0.0f  /* 0 = manivela montada justo en el punto muerto (el caso real medido) */
-#define DEFAULT_MECANISMO_CORRECCION_ACTIVA 0U   /* apagada por defecto -- hay que cargar manivela/varilla y encenderla a proposito */
 #define DEFAULT_PRESION_GANANCIA_RPM       0.0f  /* sin calibrar -- con ganancia 0 el setpoint de MODO_REMOTO queda en 0 (sin comandar) hasta que se sintonice, ver README */
 #define DEFAULT_PRESION_OFFSET_RPM         0.0f  /* idem */
 
@@ -76,9 +78,6 @@
 #define RANGO_PULSOS_MIN         0.1f
 #define RANGO_PULSOS_MAX         200.0f
 #define RANGO_ALPHA_MAX          1.0f
-#define RANGO_MECANISMO_CM_MIN   0.1f
-#define RANGO_MECANISMO_CM_MAX  200.0f
-#define RANGO_MECANISMO_OFFSET_GRADOS_MAX 179.0f
 #define RANGO_RPM_MAX_TECHO      6000.0f
 #define RANGO_TASA_CAMBIO_MAX    2000.0f
 #define RANGO_PRESION_MAX        500.0f
@@ -104,9 +103,6 @@ typedef struct {
     float    tasaMaxCambioRpmLlenadoS; /* TASA_MAX_CAMBIO_RPM_LLENADO_S */
     float    ultimaLatitudConocida;    /* GPS, 0.0f = nunca hubo fix */
     float    ultimaLongitudConocida;   /* GPS, 0.0f = nunca hubo fix */
-    float    mecanismoManivelaCm;      /* MECANISMO_MANIVELA_CM -- radio de la manivela (brazo del servo), cm */
-    float    mecanismoVarillaCm;       /* MECANISMO_VARILLA_CM -- largo de la varilla rigida biela-manivela, cm */
-    float    mecanismoOffsetGrados;    /* MECANISMO_OFFSET_GRADOS -- angulo de la manivela en SERVO_PULSO_MIN, medido desde el punto muerto (manivela alineada con la varilla) */
     float    presionGananciaRpm;       /* PRESION_GANANCIA_RPM -- ver CalibFlash_GetPresionGananciaRpm() */
     float    presionOffsetRpm;         /* PRESION_OFFSET_RPM -- idem */
 
@@ -127,8 +123,7 @@ typedef struct {
                                          * arranca directo en modo calibracion */
     uint8_t  modo;                     /* MODO (0/1/2) */
     uint8_t  nodeId;                   /* NODE_ID */
-    uint8_t  mecanismoCorreccionActiva; /* MECANISMO_CORRECCION_ACTIVA -- 0/1, ver README seccion 12 */
-    uint8_t  relleno[2];               /* completa a múltiplo de 8 bytes -- ajustar si
+    uint8_t  relleno[7];               /* completa a múltiplo de 8 bytes -- ajustar si
                                          * CalibFlash_VerificarTamano rompe la compilación */
 } CalibFlash_Datos_t;
 
@@ -224,10 +219,6 @@ void CalibFlash_Init(void)
         s_datos.ultimaLatitudConocida    = 0.0f; /* 0.0f = nunca hubo fix GPS -- mismo
                                                      * criterio que ultimaHoraUtcConocida. */
         s_datos.ultimaLongitudConocida   = 0.0f;
-        s_datos.mecanismoManivelaCm      = DEFAULT_MECANISMO_MANIVELA_CM;
-        s_datos.mecanismoVarillaCm       = DEFAULT_MECANISMO_VARILLA_CM;
-        s_datos.mecanismoOffsetGrados    = DEFAULT_MECANISMO_OFFSET_GRADOS;
-        s_datos.mecanismoCorreccionActiva = DEFAULT_MECANISMO_CORRECCION_ACTIVA;
         s_datos.presionGananciaRpm       = DEFAULT_PRESION_GANANCIA_RPM;
         s_datos.presionOffsetRpm         = DEFAULT_PRESION_OFFSET_RPM;
         s_datos.servoPulsoMinUs          = DEFAULT_SERVO_PULSO_MIN_US;
@@ -261,13 +252,6 @@ static CalibFlash_Categoria_t CalibFlash_CategoriaDe(uint8_t id)
         case CALIB_ID_SET_RATIO:
         case CALIB_ID_SET_RATIO_AUTO:
         case CALIB_ID_ALPHA:
-        /* Geometria del mecanismo (MECANISMO_*) como CALIBRACION, mismo
-         * motivo que SET_RATIO/ALPHA -- necesitan poder ajustarse sin
-         * detener el motor mientras se afina la correccion en campo. */
-        case CALIB_ID_MECANISMO_MANIVELA_CM:
-        case CALIB_ID_MECANISMO_VARILLA_CM:
-        case CALIB_ID_MECANISMO_OFFSET_GRADOS:
-        case CALIB_ID_MECANISMO_CORRECCION_ACTIVA:
         /* PID_KP/KI/KD como CALIBRACION (no CONFIGURACION por default) --
          * misma razon que SET_RATIO/ALPHA: la sintonizacion en lazo
          * cerrado (README seccion 9, metodo Ziegler-Nichols) exige subir
@@ -398,38 +382,6 @@ CalibFlash_ProtocoloStatus_t CalibFlash_ProcesarParametroConEstado(uint8_t id, c
             float nuevoValor = (float)LeerUint16BigEndian(datos) / 1000.0f;
             bool ok = CalibFlash_SetAlphaFiltro(nuevoValor);
             *valorAplicadoRaw = CodificarUint16(CalibFlash_GetAlphaFiltro(), 1000.0f);
-            if (ok) return CALIB_STATUS_OK;
-            return s_ultimaEscrituraFallo ? CALIB_STATUS_STORAGE_ERROR : CALIB_STATUS_OUT_OF_RANGE;
-        }
-
-        case CALIB_ID_MECANISMO_MANIVELA_CM: {
-            float nuevoValor = (float)LeerUint16BigEndian(datos) / 100.0f;
-            bool ok = CalibFlash_SetMecanismoManivelaCm(nuevoValor);
-            *valorAplicadoRaw = CodificarUint16(CalibFlash_GetMecanismoManivelaCm(), 100.0f);
-            if (ok) return CALIB_STATUS_OK;
-            return s_ultimaEscrituraFallo ? CALIB_STATUS_STORAGE_ERROR : CALIB_STATUS_OUT_OF_RANGE;
-        }
-
-        case CALIB_ID_MECANISMO_VARILLA_CM: {
-            float nuevoValor = (float)LeerUint16BigEndian(datos) / 100.0f;
-            bool ok = CalibFlash_SetMecanismoVarillaCm(nuevoValor);
-            *valorAplicadoRaw = CodificarUint16(CalibFlash_GetMecanismoVarillaCm(), 100.0f);
-            if (ok) return CALIB_STATUS_OK;
-            return s_ultimaEscrituraFallo ? CALIB_STATUS_STORAGE_ERROR : CALIB_STATUS_OUT_OF_RANGE;
-        }
-
-        case CALIB_ID_MECANISMO_OFFSET_GRADOS: {
-            float nuevoValor = (float)LeerUint16BigEndian(datos) / 100.0f;
-            bool ok = CalibFlash_SetMecanismoOffsetGrados(nuevoValor);
-            *valorAplicadoRaw = CodificarUint16(CalibFlash_GetMecanismoOffsetGrados(), 100.0f);
-            if (ok) return CALIB_STATUS_OK;
-            return s_ultimaEscrituraFallo ? CALIB_STATUS_STORAGE_ERROR : CALIB_STATUS_OUT_OF_RANGE;
-        }
-
-        case CALIB_ID_MECANISMO_CORRECCION_ACTIVA: {
-            uint16_t nuevoValor = LeerUint16BigEndian(datos);
-            bool ok = CalibFlash_SetMecanismoCorreccionActiva((uint8_t)nuevoValor);
-            *valorAplicadoRaw = (uint16_t)CalibFlash_GetMecanismoCorreccionActiva();
             if (ok) return CALIB_STATUS_OK;
             return s_ultimaEscrituraFallo ? CALIB_STATUS_STORAGE_ERROR : CALIB_STATUS_OUT_OF_RANGE;
         }
@@ -794,10 +746,6 @@ uint8_t  CalibFlash_GetNodeId(void)                   { return s_datos.nodeId; }
 uint16_t CalibFlash_GetHisteresisModoS(void)          { return s_datos.histeresisModoS; }
 float    CalibFlash_GetPresionObjetivo(void)          { return s_datos.presionObjetivo; }
 float    CalibFlash_GetTasaMaxCambioRpmLlenadoS(void) { return s_datos.tasaMaxCambioRpmLlenadoS; }
-float    CalibFlash_GetMecanismoManivelaCm(void)      { return s_datos.mecanismoManivelaCm; }
-float    CalibFlash_GetMecanismoVarillaCm(void)       { return s_datos.mecanismoVarillaCm; }
-float    CalibFlash_GetMecanismoOffsetGrados(void)    { return s_datos.mecanismoOffsetGrados; }
-uint8_t  CalibFlash_GetMecanismoCorreccionActiva(void) { return s_datos.mecanismoCorreccionActiva; }
 float    CalibFlash_GetPresionGananciaRpm(void)       { return s_datos.presionGananciaRpm; }
 float    CalibFlash_GetPresionOffsetRpm(void)         { return s_datos.presionOffsetRpm; }
 uint32_t CalibFlash_GetPresionUltimoTickMs(void)      { return s_presionUltimoTickMs; }
@@ -976,34 +924,6 @@ bool CalibFlash_SetTasaMaxCambioRpmLlenadoS(float v)
     return CalibFlash_EscribirEnFlash();
 }
 
-bool CalibFlash_SetMecanismoManivelaCm(float v)
-{
-    if (v < RANGO_MECANISMO_CM_MIN || v > RANGO_MECANISMO_CM_MAX) return false;
-    s_datos.mecanismoManivelaCm = v;
-    return CalibFlash_EscribirEnFlash();
-}
-
-bool CalibFlash_SetMecanismoVarillaCm(float v)
-{
-    if (v < RANGO_MECANISMO_CM_MIN || v > RANGO_MECANISMO_CM_MAX) return false;
-    s_datos.mecanismoVarillaCm = v;
-    return CalibFlash_EscribirEnFlash();
-}
-
-bool CalibFlash_SetMecanismoOffsetGrados(float v)
-{
-    if (v < 0.0f || v > RANGO_MECANISMO_OFFSET_GRADOS_MAX) return false;
-    s_datos.mecanismoOffsetGrados = v;
-    return CalibFlash_EscribirEnFlash();
-}
-
-bool CalibFlash_SetMecanismoCorreccionActiva(uint8_t v)
-{
-    if (v > 1U) return false;
-    s_datos.mecanismoCorreccionActiva = v;
-    return CalibFlash_EscribirEnFlash();
-}
-
 bool CalibFlash_SetPresionGananciaRpm(float v)
 {
     if (v < -RANGO_PRESION_GANANCIA_RPM_MAX || v > RANGO_PRESION_GANANCIA_RPM_MAX) return false;
@@ -1093,14 +1013,6 @@ static uint16_t CalibFlash_ValorActualRaw(uint8_t id)
             return CodificarUint16(CalibFlash_GetPulsosPorRevolucion(), 100.0f);
         case CALIB_ID_ALPHA:
             return CodificarUint16(CalibFlash_GetAlphaFiltro(), 1000.0f);
-        case CALIB_ID_MECANISMO_MANIVELA_CM:
-            return CodificarUint16(CalibFlash_GetMecanismoManivelaCm(), 100.0f);
-        case CALIB_ID_MECANISMO_VARILLA_CM:
-            return CodificarUint16(CalibFlash_GetMecanismoVarillaCm(), 100.0f);
-        case CALIB_ID_MECANISMO_OFFSET_GRADOS:
-            return CodificarUint16(CalibFlash_GetMecanismoOffsetGrados(), 100.0f);
-        case CALIB_ID_MECANISMO_CORRECCION_ACTIVA:
-            return (uint16_t)CalibFlash_GetMecanismoCorreccionActiva();
         case CALIB_ID_RPM_MAX:
             return CodificarUint16(CalibFlash_GetRpmMax(), 10.0f);
         case CALIB_ID_RPM_MIN:

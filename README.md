@@ -624,12 +624,9 @@ downlink fue rechazado, es el valor anterior, no el solicitado.
 | 23 | `PRESION_OBJETIVO` | x10 | 2B uint16 | Configuración | Umbral fase llenado→régimen |
 | 24 | `TASA_MAX_CAMBIO_RPM_LLENADO_S` | x10 | 2B uint16 | Configuración | Rampa conservadora (llenado tubería) |
 | 25 | `SET_RATIO_AUTO` | x10 (entrada) | 2B uint16 | Calibración | El valor recibido es el RPM que marca un tacómetro de referencia externo en ese instante, NO el ratio — el firmware calcula `SET_RATIO = frecuenciaHz_actual × 60 / RPM_recibido` y lo aplica (misma validación de rango que `SET_RATIO`, mismo campo persistido). El valor vigente devuelto en el ACK es el ratio resultante, codificado x100 como `SET_RATIO` (no eco del RPM recibido). `OUT_OF_RANGE` si se manda `0` o si el motor no tiene lectura de tacómetro válida (`frecuenciaHz == 0`) — no hay nada que calcular sin motor girando. Ver sección 12 |
-| 26 | `MECANISMO_MANIVELA_CM` | x100 | 2B uint16 | Calibración | Radio de la manivela (brazo del servo) del mecanismo biela-manivela actual, en cm. Usado por la corrección de linealización geométrica del PID — ver sección 12. Default `5.5` (medido en campo 2026-09-03) |
-| 27 | `MECANISMO_VARILLA_CM` | x100 | 2B uint16 | Calibración | Largo de la varilla rígida (biela) del mecanismo, en cm. Default `30.0` (medido en campo 2026-09-03) |
-| 28 | `MECANISMO_OFFSET_GRADOS` | x100 | 2B uint16 | Calibración | Ángulo de la manivela en `SERVO_PULSO_MIN`, medido desde el punto muerto (manivela alineada con la varilla). `0` = montada justo en el punto muerto (el caso medido en campo). Rango `0-179` |
-| 29 | `MECANISMO_CORRECCION_ACTIVA` | directo (0/1) | 2B uint16 | Calibración | Prende/apaga la corrección de linealización sin perder los valores de manivela/varilla cargados. Default `0` (apagada) — hay que cargar la geometría y encenderla a propósito. Interina: pensada para descartarse si se reemplaza el mecanismo (piñón-cremallera, o montaje directo del servo sobre el eje de la palanca de la bomba) |
-| 30 | `PRESION_GANANCIA_RPM` | x100 | 2B int16 | Calibración | Con signo. Fórmula lineal presión→RPM de `MODO=2` (sección 4.3) — solo se acepta con `CONTROL_HABILITADO=7`, igual que `PID_KP/KI/KD`. Default `0` (sin calibrar, `MODO=2` no hace nada hasta que se calibre) |
-| 31 | `PRESION_OFFSET_RPM` | x10 | 2B uint16 | Calibración | RPM base de la fórmula de `MODO=2`. Igual gate que `PRESION_GANANCIA_RPM`. Default `0` |
+| 26 | `PRESION_GANANCIA_RPM` | x100 | 2B int16 | Calibración | Con signo. Fórmula lineal presión→RPM de `MODO=2` (sección 4.3) — solo se acepta con `CONTROL_HABILITADO=7`, igual que `PID_KP/KI/KD`. Default `0` (sin calibrar, `MODO=2` no hace nada hasta que se calibre). ID corrido de `30`→`26` el 2026-09-11 para ocupar el hueco que dejó `MECANISMO_*` |
+| 27 | `PRESION_OFFSET_RPM` | x10 | 2B uint16 | Calibración | RPM base de la fórmula de `MODO=2`. Igual gate que `PRESION_GANANCIA_RPM`. Default `0`. ID corrido de `31`→`27` el 2026-09-11 |
+| 28-29 | *(libres)* | — | — | — | Antes parte de `MECANISMO_*` (corrección geométrica de la biela-manivela) — removidos 2026-09-11 junto con el mecanismo, ver sección 12. No reasignar sin confirmar que ningún nodo viejo en campo los siga usando |
 
 **Ganancias PID con signo**: se codifican como `int16` (complemento a
 2), no `uint16` — un consumidor debe reinterpretar valores > 32767
@@ -722,8 +719,8 @@ observando la RPM real contra la presión real):
 
 | ID | Nombre | Escala | Notas |
 |---|---|---|---|
-| 30 | `PRESION_GANANCIA_RPM` | x100, con signo | RPM por unidad de presión |
-| 31 | `PRESION_OFFSET_RPM` | x10 | RPM base (presión=0) |
+| 26 | `PRESION_GANANCIA_RPM` | x100, con signo | RPM por unidad de presión |
+| 27 | `PRESION_OFFSET_RPM` | x10 | RPM base (presión=0) |
 
 `setpoint = PRESION_OFFSET_RPM + PRESION_GANANCIA_RPM * PRESION`,
 recortado igual que el resto (`RPM_MIN`/`RPM_MAX`). Default de ambos:
@@ -1152,14 +1149,16 @@ escribir `SET_RATIO 17.5` y Enter.
         ver sección 12).
       - `ALPHA_AUTO` NO necesita entrada propia — quedó como
         `CONTROL_HABILITADO=5`, cubierto por el bump de arriba.
-      - `PARAMETER_TABLE` necesita 4 entradas nuevas para
-        `MECANISMO_MANIVELA_CM`/`MECANISMO_VARILLA_CM` (IDs `26`/`27`,
-        escala x100), `MECANISMO_OFFSET_GRADOS` (ID `28`, escala x100),
-        y `MECANISMO_CORRECCION_ACTIVA` (ID `29`, directo 0/1) — ver
-        sección 12.
-      - **Nuevo 2026-09-07**: `PARAMETER_TABLE` necesita 2 entradas
-        nuevas para `PRESION_GANANCIA_RPM` (ID `30`, escala x100, con
-        signo) y `PRESION_OFFSET_RPM` (ID `31`, escala x10) — sin ellas
+      - **Nuevo 2026-09-11**: IDs `26-29` (antes `MECANISMO_*`) quedaron
+        libres al quitarse el mecanismo biela-manivela — si ya se
+        habían agregado a `PARAMETER_TABLE`, quitarlos de ahí también.
+        `PRESION_GANANCIA_RPM`/`PRESION_OFFSET_RPM` se corrieron de
+        `30`/`31` a `26`/`27` para ocupar ese hueco (`28-29` siguen
+        libres) — si ya estaban en `PARAMETER_TABLE` con `30`/`31`,
+        actualizar los IDs, no solo agregar entradas nuevas.
+      - `PARAMETER_TABLE` necesita 2 entradas para
+        `PRESION_GANANCIA_RPM` (ID `26`, escala x100, con
+        signo) y `PRESION_OFFSET_RPM` (ID `27`, escala x10) — sin ellas
         `MODO=2` no se puede calibrar por downlink LoRa, solo por
         serial. Ver sección 4.3.
       - **Aviso importante, no es un cambio de tabla**: `MODO` (ID 16)
@@ -2077,83 +2076,21 @@ actual no tiene. Se sigue calibrando a mano (`CONTROL_HABILITADO=2`).
 Si en el futuro se agrega sensado de corriente al servo, ahí sí valdría
 la pena automatizarlo.
 
-### Corrección de linealización geométrica del mecanismo (`MECANISMO_*`, interina, agregada 2026-09-03)
+### Corrección geométrica del mecanismo biela-manivela — REMOVIDA (2026-09-11)
 
-El actuador actual es un mecanismo biela-manivela: el brazo del servo
-(la manivela) gira y empuja una varilla rígida (la biela) hacia la
-palanca de la bomba de inyección. Este tipo de mecanismo tiene una
-relación **no lineal** entre el ángulo del servo y la posición real
-que alcanza la varilla — la misma raíz que explica varios hallazgos de
-esta sesión: la zona muerta más ancha de lo esperado en
-`CONTROL_HABILITADO=4`, la rampa gradual (no un escalón limpio) en esa
-misma calibración, y la ganancia del motor variando ~16-25x según el
-punto de operación durante la sintonización de PID.
-
-**Geometría real, confirmada en campo 2026-09-03**: manivela
-`r=5.5cm`, varilla `L=30cm`, montada exactamente en el **punto
-muerto** (manivela y varilla alineadas, una continuación de la otra)
-en `SERVO_PULSO_MIN` — la posición de menor ganancia posible del
-mecanismo. La posición real de la varilla en función del ángulo de la
-manivela sigue la ecuación clásica de biela-manivela (la misma de un
-pistón de motor):
-
-```
-x(θ) = r·cos(θ) + √(L² − r²·sin²(θ))
-```
-
-Con estos números, en el rango real de operación (`~60°`), el avance
-por cada `10°` de giro crece de forma casi constante desde `~1mm`
-(cerca del punto muerto) hasta `~8.7mm` (al final del recorrido) — casi
-9 veces más ganancia al final que al principio, para el mismo `Kp` del
-PID.
-
-**La corrección**: en vez de ignorar esta curva, se invierte
-matemáticamente. Se trata el pulso que ya calculó el PID (con
-`Kp/Ki/Kd`, sin tocar esas ganancias) como si representara linealmente
-una posición `x` deseada entre los dos extremos reales del mecanismo
-(en `SERVO_PULSO_MIN` y `SERVO_PULSO_MAX`), y se despeja el ángulo real
-que efectivamente logra esa `x`, usando la inversa exacta de la
-ecuación de arriba — que resulta ser la ley de cosenos aplicada al
-mismo triángulo (manivela-varilla-posición):
-
-```
-cos(θ) = (r² + x² − L²) / (2·r·x)
-```
-
-Ese `θ` real se convierte de vuelta a un pulso (usando
-`MECANISMO_US_POR_GRADO`, una constante fija en `main.c` que asume la
-calibración típica `500-2500µs ↔ 180°` de un servo de hobby estándar
-como el MG996R usado — revisar si se cambia de modelo de servo), y ese
-es el pulso que realmente se le manda al servo. Implementado en
-`Mecanismo_CorregirPulso()` (`main.c`), aplicado solo en la rama activa
-del PID (no afecta los modos `1`/`2`/`3`/`4`/`5`/`6`, que mueven el
-servo directo sin pasar por el PID).
-
-**Parámetros nuevos** (`MECANISMO_MANIVELA_CM`, `MECANISMO_VARILLA_CM`,
-`MECANISMO_OFFSET_GRADOS`, `MECANISMO_CORRECCION_ACTIVA` — IDs 26-29,
-ver tabla de parámetros): `MECANISMO_OFFSET_GRADOS` generaliza la
-fórmula para el caso de remontar la manivela lejos del punto muerto en
-el futuro (ver discusión de campo: alejar el montaje `15-20°` del
-punto muerto suaviza bastante la curva, aunque no la elimina — solo un
-mecanismo genuinamente lineal, como piñón-cremallera, o el servo
-montado directo sobre el eje de la palanca de la bomba, elimina la
-no-linealidad de raíz en vez de compensarla). `MECANISMO_CORRECCION_ACTIVA`
-queda apagada por defecto (`0`) — hay que cargar la geometría real y
-encenderla a propósito; si la geometría cargada es inválida (radio o
-varilla en `0`, o varilla ≤ radio), la corrección se salta sola y el
-pulso pasa sin corregir, para no romper el control por una
-configuración incompleta.
-
-**Por qué es "interina"**: esta corrección compensa el mecanismo
-biela-manivela *actual* — no reemplaza un rediseño mecánico. Está
-pensada explícitamente para descartarse (dejar `MECANISMO_CORRECCION_ACTIVA=0`,
-sin necesidad de quitar el código) si se reemplaza el actuador por un
-mecanismo genuinamente lineal — piñón-cremallera, o la idea explorada
-en paralelo de montar el servo directo sobre el eje de la palanca de
-la bomba (sin brazo ni varilla intermedios, eliminando la geometría
-por completo en vez de corregirla). Ver la memoria del proyecto para
-la discusión completa de ambas alternativas y el análisis de ventaja
-mecánica (torque) que también depende de esta misma geometría.
-
-**Pendiente**: compilado limpio (0 errores/0 warnings), no probado en
-campo todavía.
+Existió entre 2026-09-03 y 2026-09-11 una corrección de linealización
+geométrica (`MECANISMO_*`, IDs 26-29, función `Mecanismo_CorregirPulso()`
+en `main.c`) para compensar la relación no lineal ángulo-servo↔posición
+real de la varilla del mecanismo biela-manivela original (manivela
+`r=5.5cm`, varilla `L=30cm`, montada en el punto muerto — ecuación
+`x(θ) = r·cos(θ) + √(L² − r²·sin²(θ))` y su inversa exacta, ley de
+cosenos). Quedaba apagada por defecto (`MECANISMO_CORRECCION_ACTIVA=0`)
+y nunca se activó una vez que se adoptó el montaje directo del servo
+(branch `servo-directo`, ver más arriba en esta misma sección) — el
+montaje directo no tiene esta no-linealidad geométrica (el servo
+acopla 1:1 con la palanca), así que la corrección quedó permanentemente
+inerte y se quitó del código por completo (parámetros, función, IDs
+26-29 liberados — no reasignar sin confirmar que ningún nodo viejo en
+campo los siga usando). El mecanismo biela-manivela + esta corrección
+siguen intactos en la rama `main` como punto de retorno, ver
+[[project-rio-dsl-mechanism-redesign]] en la memoria del proyecto.
