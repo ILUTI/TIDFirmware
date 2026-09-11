@@ -194,8 +194,9 @@ bool RAK3172_EnviarRPM(float rpm);
  *
  * @param motorIdNumeric           Numérico del nodo (ej. 1 -> "DSL-0001").
  * @param rpm                      RPM actual.
- * @param presion                  Presión de salida del motor (0.0f
- *                                 mientras no exista presion.c).
+ * @param presion                  Presión de salida de la motobomba, en
+ *                                 PSI (ver presion.c,
+ *                                 Presion_GetPresionPsi()).
  * @param estado                   1=ACTIVO, 2=APAGADO, 3=ENCENDIDO (ver
  *                                 ESTADO_* en main.c).
  * @param fechaHoraLocal           Epoch unix, YA con el offset de

@@ -48,7 +48,13 @@
 #define DEFAULT_PID_KD                    0.0f
 #define DEFAULT_SERVO_PULSO_MIN_US        1000U
 #define DEFAULT_SERVO_PULSO_MAX_US        2000U
-#define DEFAULT_TIMEOUT_SIN_COMANDO_S     1800U   /* 30 min, mayor al Estado 1 del aspersor (15-20 min) */
+#define DEFAULT_TIMEOUT_SIN_COMANDO_S     360U    /* 4x el reporte real del aspersor durante MODO=2
+                                                     * activo (90s), confirmado en campo 2026-09-09 --
+                                                     * el "15-20 min" documentado antes era del reporte
+                                                     * en standby del aspersor, NO del estado activo
+                                                     * que corresponde a MODO=2. Solo importa en
+                                                     * MODO_REMOTO (ver watchdog en main.c) -- MODO=0/1
+                                                     * no usan este parametro para nada. */
 #define DEFAULT_TASA_MAX_CAMBIO_RPM_S     50.0f
 #define DEFAULT_CONTROL_HABILITADO        0U
 #define DEFAULT_INTERVALO_OPERATIVO_S     30U

@@ -29,6 +29,7 @@
 #include "rtc_reloj.h"
 #include "gps.h"
 #include "comando_serial.h"
+#include "presion.h"
 #include <stdio.h>
 #include <math.h>
 /* USER CODE END Includes */
@@ -218,9 +219,15 @@ static uint16_t Mecanismo_CorregirPulso(uint16_t pulsoCrudo)
 
 /* Codigos de estado -- DEBEN coincidir exactamente con ESTADO_NOMBRES
  * de decoder.py del lado AWS. */
-#define ESTADO_ACTIVO     1U  /* motor encendido Y con presion de salida -- no alcanzable aun, falta presion.c */
+#define ESTADO_ACTIVO     1U  /* motor operando Y con presion de salida real (ver presion.c) */
 #define ESTADO_APAGADO    2U
-#define ESTADO_ENCENDIDO  3U  /* motor girando, sin lectura de presion real todavia (placeholder) */
+#define ESTADO_ENCENDIDO  3U  /* motor girando, sin presion de salida suficiente aun (arranque/sin carga) */
+
+/* Umbral de presion (PSI) que distingue ACTIVO de solo ENCENDIDO.
+ * ⚠️ SUPUESTO / placeholder sin dato de campo todavia -- ajustar una
+ * vez que se tenga una sesion real con el sistema hidraulico cargado
+ * (ver README seccion 8). */
+#define PRESION_UMBRAL_ACTIVO_PSI  5.0f
 
 /* Coordenadas fijas del sitio -- ultimo respaldo si el GPS nunca ha
  * conseguido fix (ni en este arranque ni en ninguno anterior, ver
@@ -238,6 +245,8 @@ static uint16_t Mecanismo_CorregirPulso(uint16_t pulsoCrudo)
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+
 UART_HandleTypeDef hlpuart1;
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
@@ -263,6 +272,7 @@ static void MX_USART2_UART_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_RTC_Init(void);
 static void MX_LPUART1_UART_Init(void);
+static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -308,6 +318,7 @@ int main(void)
   MX_TIM3_Init();
   MX_RTC_Init();
   MX_LPUART1_UART_Init();
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
 
   CalibFlash_Init();
@@ -323,6 +334,8 @@ int main(void)
   Tacometro_Init(&htim2, TIM_CHANNEL_1);
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
   HAL_TIM_IC_Start(&htim2, TIM_CHANNEL_2);
+
+  Presion_Init(&hadc1);
 
   /* RAK3172 en USART1 (PA9/PA10). LoRa es prioridad ante todo lo demas
    * en el arranque -- se inicializa y se pide el join ANTES del GPS,
@@ -408,6 +421,7 @@ int main(void)
   {
 
 	  Tacometro_Update();
+	  Presion_Update();
 
   	  /* MEDIDA TEMPORAL DE DIAGNOSTICO (2026-09-03): en CONTROL_HABILITADO=7
   	   * (sintonizacion de PID) se saltea RAK3172_Update()/GPS_Update() por
@@ -568,18 +582,27 @@ int main(void)
 	  }
 
   	  /* ================== Estado del motor + uplink LIVE extendido ==================
-  	   * ⚠️ SUPUESTO / placeholder: sin sensor de presion de motor todavia
-  	   * (ver README, seccion 5 -- "disenado, no construido"), el estado
-  	   * ACTIVO (requiere presion) NO es alcanzable aun. Se deriva
-  	   * ENCENDIDO/APAGADO solo del RPM. Cuando exista presion.c, agregar
-  	   * la condicion real de ACTIVO aqui. */
-  	  static uint8_t estadoAnterior = ESTADO_APAGADO;
+  	   * ACTIVO requiere motor operando Y presion de salida real de la
+  	   * motobomba (no solo RPM > 0) -- ver README seccion 4.2/5.
+  	   * PRESION_UMBRAL_ACTIVO_PSI es un primer valor conservador sin
+  	   * dato de campo todavia: distingue "presion real de bombeo" de
+  	   * ruido/offset residual con la bomba sin carga. Ajustar con datos
+  	   * reales del sistema hidraulico cuando esten disponibles. */
+	  static uint8_t estadoAnterior = ESTADO_APAGADO;
 	  static uint32_t inicioEstadoLocal = 0;
 	  static bool estadoInicializado = false;
 	  static uint32_t fechaHoraLocalIterAnterior = 0;
 
 	  float rpmActual = Tacometro_GetRPMFiltrada();
-	  uint8_t estadoActual = (rpmActual > 0.0f) ? ESTADO_ENCENDIDO : ESTADO_APAGADO;
+	  float presionActual = Presion_GetPresionPsi();
+	  uint8_t estadoActual;
+	  if (rpmActual <= 0.0f) {
+		  estadoActual = ESTADO_APAGADO;
+	  } else if (Presion_SensorValido() && presionActual > PRESION_UMBRAL_ACTIVO_PSI) {
+		  estadoActual = ESTADO_ACTIVO;
+	  } else {
+		  estadoActual = ESTADO_ENCENDIDO;
+	  }
 
 	  uint32_t fechaHoraLocalIterActual = Reloj_GetUnixTimeLocal();
 
@@ -629,7 +652,7 @@ int main(void)
   		  bool encolado = RAK3172_EnviarUplinkLive(
   			  MOTOR_ID_NUMERIC,
   			  rpmActual,
-  			  0.0f,  /* presion: placeholder hasta que exista presion.c */
+  			  presionActual,
   			  estadoActual,
   			  fechaHoraLocal,
   			  inicioEstadoLocal,
@@ -671,13 +694,16 @@ int main(void)
   	  static uint32_t ultimoReporte = 0;
   	  if (HAL_GetTick() - ultimoReporte >= 1000) {
   		  ultimoReporte = HAL_GetTick();
-  		  printf("Frecuencia: %.1f Hz | RPM instant: %.1f | RPM filtrada: %.1f | Detenido: %d | RuidoFiltrado: %lu | RelojSync: %d\r\n",
+  		  printf("Frecuencia: %.1f Hz | RPM instant: %.1f | RPM filtrada: %.1f | Detenido: %d | RuidoFiltrado: %lu | RelojSync: %d | Presion: %.2f PSI (%.2fmA%s)\r\n",
   			  Tacometro_GetFrecuenciaHz(),
   			  Tacometro_GetRPMInstantanea(),
   			  Tacometro_GetRPMFiltrada(),
   			  Tacometro_EstaDetenido(),
   			  Tacometro_GetContadorRuidoFiltrado(),
-  			  Reloj_EstaSincronizado());
+  			  Reloj_EstaSincronizado(),
+  			  Presion_GetPresionPsi(),
+  			  Presion_GetCorrienteMa(),
+  			  Presion_SensorValido() ? "" : ",FALLA_SENSOR");
   	  }
 
   	  /* Log de alta frecuencia para identificar el modelo de la planta
@@ -1366,6 +1392,74 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_MultiModeTypeDef multimode = {0};
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.GainCompensation = 0;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure the ADC multi-mode
+  */
+  multimode.Mode = ADC_MODE_INDEPENDENT;
+  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_2;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_640CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**

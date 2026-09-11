@@ -10,33 +10,17 @@ entrada 4-20mA.
 
 ---
 
-## 1. Hardware y mapa de pines
+## 1. Hardware
 
-MCU: **STM32G431KBT6U**, LQFP32, Nucleo-32 (NUCLEO-G431KB).
+La documentación de hardware (mapa de pines completo, alimentación,
+circuitos de acondicionamiento de señal, y hallazgos de campo sobre
+componentes físicos) vive en un repo/documento separado:
 
-| Pin | Función | Periférico | Notas |
-|---|---|---|---|
-| PA0 | Tacómetro (Input Capture) | TIM2_CH1 | Señal ya acondicionada (PC817 + diodo serie) |
-| PA9 | RAK3172 TX | USART1_TX | — |
-| PA10 | RAK3172 RX | USART1_RX | — |
-| PA2 | Debug TX | LPUART1_TX | Vía adaptador USB-TTL (CP2102) |
-| PA3 | Debug RX | LPUART1_RX | — |
-| PB3 | GPS (SIM7600X) TX | USART2_TX | Va al pin RX del módulo |
-| PB4 | GPS (SIM7600X) RX | USART2_RX | Va al pin TX del módulo — pull-up habilitado |
-| PB0 | Servo (PWM) | TIM3_CH3 | **No usar PA6/TIM3_CH1** — el header físico de esa posición en el Nucleo-32 está enrutado a PA15 por el solder bridge SB3 de fábrica (ver UM2397, Tabla 9), PA6 no llega al header |
-| PA1 | Sensor de presión (ADC) | ADC1_IN2 | Pendiente de implementar (`presion.c/h`) |
+📄 **[`TIDHardware/TID/README.md`](../../TIDHardware/TID/README.md)**
 
-⚠️ **El debug se movió de USART2 a LPUART1** (2026-08-18) para liberar
-USART2 para el GPS. `USART1` (RAK) se quedó exactamente donde estaba.
-Si CubeMX vuelve a reasignar pines al agregar/quitar un periférico
-(pasó varias veces durante esta migración, incluyendo una petición de
-DMA huérfana que quedó apuntando a un periférico ya deshabilitado),
-revisar siempre `Mcu.IPx`/`Dma.Request*` en el `.ioc` contra lo que se
-espera, no confiar solo en que "compiló".
-
-**RTC**: el RTC usa el reloj interno **LSI (32kHz nominal)**, sin
-cristal LSE ni pila de respaldo (VBAT) — ver sección 2.5 para el porqué
-y sus implicancias.
+Este README (firmware) referencia ese documento cada vez que hace
+falta el detalle físico de un circuito — busca los enlaces "ver
+hardware" a lo largo de las secciones siguientes.
 
 ---
 
@@ -75,15 +59,11 @@ separadas.
   coeficiente configurable en caliente (`ALPHA`, ver protocolo de
   parámetros).
 
-Circuito de entrada: **H11AA1** (optoacoplador de 2 LEDs anti-paralelos,
-detecta ambos semiciclos de la señal AC por sí solo — a diferencia del
-PC817/JC817, que solo tienen 1 LED y requerirían un diodo en serie o
-puente rectificador adicional si se quisiera sustituir), alimentado
-desde el terminal W del alternador vía R1 (680Ω/3W) + clamp zener
-(D1/D2) + R3 (2.2kΩ) + D3 + C1. Factor de calibración de campo
+Circuito de entrada (H11AA1 + acondicionamiento de la señal `W` del
+alternador) → ver hardware, sección 3. Factor de calibración de campo
 confirmado: **`SET_RATIO = 17.5`** pulsos/revolución (incluye relación
 de poleas alternador:motor, con 1 pulso/ciclo AC confirmado en campo
-con el motor real).
+con el motor real) — es el default de `TACOMETRO_PULSOS_POR_REVOLUCION`.
 
 ### 2.2 `rak3172.c/h`
 
@@ -112,8 +92,8 @@ Comunicación con el módulo LoRaWAN por USART1, DMA en modo Normal.
 **Configuración crítica que resolvió un bug de cuelgue en reset**
 (con el RAK3172 conectado): USART1 (no LPUART1), DMA modo Normal (no
 Circular), `Overrun`/`DMA on RX Error` deshabilitados en el `.ioc`,
-pull-up en el pin RX, y limpieza de flags de error antes de rearmar la
-recepción en cada `RAK3172_Init()`.
+pull-up en el pin RX (ver hardware, sección 4), y limpieza de flags de
+error antes de rearmar la recepción en cada `RAK3172_Init()`.
 
 **FPorts usados**:
 
@@ -220,16 +200,10 @@ terminado" (en curso → listo), que reporta cada finalización real sin
 importar si el resultado se repite.
 
 ⚠️ **Caso de campo abierto (2026-08-29): reinicios espontáneos del
-RAK3172.** Se observó el módulo reiniciándose solo repetidamente
-(reaparece su banner de arranque `RAKwireless RAK3172-E...` en medio de
-la sesión, cada 10-30s en el peor caso, formando un ciclo de reinicios)
-— la lógica de los puntos 4-5 de arriba maneja esto correctamente
-(detecta la caída y reintenta sin quedarse trabado), pero la causa raíz
-de por qué el módulo se reinicia **no es de software**: se sospecha de
-la conexión de la antena o de la alimentación (picos de corriente de
-TX de LoRa hundiendo el rail de alimentación — ver hallazgos de
-hardware de este proyecto sobre márgenes ajustados de energía). En
-investigación, ver pendientes (sección 8).
+RAK3172** (banner de arranque reaparece en medio de la sesión) — la
+lógica de los puntos 4-5 de arriba maneja esto correctamente (detecta
+la caída y reintenta sin quedarse trabado), pero la causa raíz **no es
+de software** → ver hardware, sección 4, y pendientes (sección 8).
 
 #### Sincronización de hora: GPS (primaria) + LoRaWAN DeviceTimeReq (respaldo)
 
@@ -460,9 +434,7 @@ en lazo cerrado, ver sección 9; solo se pueden tocar en
 `CONTROL_HABILITADO=7`) — suficientes para validar que el lazo mueve
 el servo en la dirección correcta, no para un control ya afinado.
 
-**Alimentación del servo**: fuente externa 5-6V, GND común con el
-G431, señal PWM a 3.3V (compatible con la mayoría de servos de RC sin
-level shifter).
+**Alimentación del servo** → ver hardware, sección 2.
 
 ### 2.5 `rtc_reloj.c/h`
 
@@ -530,50 +502,9 @@ sesión previa), una pausa de 1.5s, y por último `AT+CGPSINFO=10`
 el bug de abajo **no era esto**.
 
 ✅ **RESUELTO (2026-08-25) — causa raíz real: el cable USB del Nucleo
-a la PC, no el firmware.** El GPS nunca daba fix tras un arranque en
-frío real **mientras el cable USB del Nucleo a la computadora estaba
-conectado** (el mismo que se usa para ver el monitor serie de debug).
-Confirmado con una prueba A/B limpia, mismo hardware, un solo cable
-como única variable: con el USB del Nucleo conectado a la PC, el GPS
-se queda en `+CGPSINFO: ,,,,,,,,,` (vacío) indefinidamente; al
-desconectarlo, engancha fix casi de inmediato. Reproducido de forma
-consistente. Hipótesis del mecanismo: con el Nucleo alimentado por
-batería **y** por USB al mismo tiempo, las dos tierras (batería/PC)
-meten ruido eléctrico al plano de tierra compartido — un UART digital
-lo tolera sin problema (por eso los comandos AT siempre respondían
-bien), pero el front-end de RF del receptor GNSS, tratando de
-detectar señales de satélite muy débiles, es mucho más sensible a ese
-ruido.
-
-**Implicación importante**: en campo, el Nucleo va a estar alimentado
-solo por batería, sin ninguna laptop conectada por USB — es probable
-que este bug **nunca ocurra en operación real**, solo se manifestaba
-por estar viendo el log de depuración en el banco mientras el sistema
-corría con alimentación externa simultánea. Pendiente de una
-confirmación final: un ciclo de encendido con USB desconectado desde
-el principio (no solo reconectado después) para verificar que el GPS
-ya tiene fix cuando finalmente se conecta el monitor.
-
-**Vías investigadas y descartadas antes de encontrar la causa real**
-(no volver a intentarlas sin evidencia nueva — todas con evidencia
-real de campo):
-- Timing de `AT+CGPS=1`/`AT+CGPSINFO=10` (delays de 0.5s a 10s, espera
-  event-driven del `'RDY'`) — el comando siempre llegaba y se
-  ejecutaba bien; probado también con delay largo y corto vía USB-TTL
-  aislado, ambos funcionaron — no era timing.
-- `AT+CGPSCOLD` (cold start explícito) en vez de `AT+CGPS=1` — devolvió
-  `ERROR`, no soportado en esta versión de firmware del módulo.
-- Interferencia RF del RAK3172 (LoRaWAN transmitiendo durante la
-  adquisición GNSS) — descartado con el RAK3172 desconectado de
-  energía, el GPS seguía sin dar fix mientras el USB del Nucleo
-  estuviera conectado.
-- Capacitor electrolítico local en los pines de alimentación del
-  módulo GPS — probado, no cambió nada.
-- Regulador compartido con el servo — descartado, ya están en ramas
-  separadas.
-- "El STM32 no reflashea bien" — descartado: un simple reset por botón
-  (sin cargar código nuevo) ya funcionaba, así que nunca fue cuestión
-  de código nuevo.
+a la PC, no el firmware ni el módulo** → ver hardware, sección 6.2 para
+el análisis completo (prueba A/B, hipótesis del mecanismo, y las vías
+descartadas antes de encontrar la causa real).
 
 **Prioridad de posición para el uplink LIVE** (`main.c`): GPS con fix
 vivo (`GPS_TieneFix()`) → última posición conocida persistida en flash
@@ -589,28 +520,8 @@ hhmmss.s` del formato de arriba — antes descartados, solo se usaba
 lat/lon). Es la fuente **primaria** de sincronización del RTC, con la
 red LoRaWAN como respaldo — ver sección 2.2 para el mecanismo completo.
 
-**⚠️ Hallazgos de hardware del Waveshare SIM7600X-H 4G HAT** (ninguno
-obvio desde el firmware, costaron varias horas de campo):
-
-- **Alimentación**: el módulo necesita una fuente de 5V **separada**
-  del STM32 (picos de hasta ~2A) — alimentarlo desde el pin 3.3V/5V del
-  Nucleo no le alcanza para arrancar el módem por completo (el LED
-  "PWR" enciende igual, pero el chip nunca llega a responder ningún
-  comando AT). GND sí debe ser compartido con el STM32.
-- **Jumper "PWR"**: debe estar en **`PWR—3V3`** (arranque automático al
-  detectar alimentación), no en `PWR—D6` (que espera una señal de
-  encendido de un GPIO de Raspberry Pi que este proyecto no tiene —
-  sin ella, el módem nunca arranca, aunque el LED de alimentación esté
-  encendido).
-- **Jumper "UART JMP"** (3 posiciones, cada una puentea un par
-  adyacente en la fila CP2102—PI—SIM7600X): **posición B** (PI↔SIM) es
-  la que conecta el módem directo a los pines del header (donde está
-  cableado el STM32, haciendo de "PI"). Posición A (CP2102↔PI) y C
-  (SIM↔CP2102) enrutan hacia el chip USB-serial integrado, no hacia el
-  header — con el jumper en la posición equivocada, el STM32 no recibe
-  absolutamente nada aunque el cableado esté perfecto.
-- **Antena**: la de GPS va específicamente en el conector marcado
-  **GNSS** (no en `MAIN` ni `AUX`, que son para la antena celular/LTE).
+⚠️ **Hallazgos de hardware del Waveshare SIM7600X-H 4G HAT** (jumpers,
+alimentación, antena) → ver hardware, sección 6.1.
 
 **Bug corregido (2026-08-18)**: el ciclo de consumo del buffer circular
 en `GPS_RxEventCallback()` se colgaba indefinidamente cuando el DMA
@@ -739,18 +650,28 @@ Motor operando  -> solo CALIBRACION y PROCESO se aceptan;
 Determinado por `!Tacometro_EstaDetenido()`, consultado en
 `rak3172.c` y pasado a `CalibFlash_ProcesarParametroConEstado()`.
 
-### 4.2 Estado del motor para telemetría (ENCENDIDO/APAGADO, parcialmente implementada)
+### 4.2 Estado del motor para telemetría (ENCENDIDO/APAGADO/ACTIVO — implementada 2026-09-09)
 
-Distinto de la máquina de estados del gobernador (4.3, sin
-implementar) — este es el campo `estado` que viaja en el uplink LIVE
-(ver sección 6), calculado en `main.c`:
+Distinto de la máquina de estados del gobernador (4.3) — este es el
+campo `estado` que viaja en el uplink LIVE (ver sección 6), calculado
+en `main.c`:
 
 ```
 ESTADO_APAGADO   (2): rpm == 0
-ESTADO_ENCENDIDO (3): rpm > 0, placeholder hasta que exista presión real
-ESTADO_ACTIVO    (1): rpm > 0 Y con presión de salida del motor -- NO
-                       alcanzable aún, falta presion.c (ver sección 5)
+ESTADO_ENCENDIDO (3): rpm > 0, pero sin presión de salida suficiente
+                       (arranque, motobomba sin carga/cebando)
+ESTADO_ACTIVO    (1): rpm > 0 Y Presion_GetPresionPsi() > PRESION_UMBRAL_ACTIVO_PSI
+                       (ver presion.c, sección 5)
 ```
+
+⚠️ **`PRESION_UMBRAL_ACTIVO_PSI` (5.0 PSI, `main.c`) es un placeholder
+sin dato de campo todavía** — distingue "presión real de bombeo" de
+ruido/offset residual con la bomba sin carga, pero el valor correcto
+depende del sistema hidráulico real (ver pendientes, sección 8). Si
+`Presion_SensorValido()` es `false` (lazo 4-20mA abierto o en
+corto/sobre-rango), el estado nunca sube a `ACTIVO` aunque el motor
+esté girando — se trata como si no hubiera presión, no como un valor
+de `0` confiable.
 
 `inicio_operacion`/`segundos_transcurridos` se recalculan cada vez que
 `estado` cambia, usando `Reloj_GetUnixTimeLocal()` (ver el detalle del
@@ -818,7 +739,20 @@ fuerza el setpoint a "sin comandar" -- el motor cae a ralentí natural
 último valor de presión, ya viejo (ej. si la Lambda que reenvía
 `PRESION` se cae, o los aspersores se quedan sin batería). Se loguea
 por flanco (`MODO_REMOTO: sin PRESION valida...`/`...reanudando control
-por presion`), no en cada vuelta del loop.
+por presion`), no en cada vuelta del loop. `MODO=0`/`1` no usan este
+parámetro para nada -- solo importa en `MODO=2`.
+
+⚠️ **Default corregido 2026-09-09**: el aspersor reporta cada **90s**
+mientras está activamente gobernando el motor en `MODO=2` (el
+"15-20 min" documentado antes era del reporte en *standby* del
+aspersor, no del estado activo relevante acá). `DEFAULT_TIMEOUT_SIN_COMANDO_S`
+se corrigió de `1800s` a **`360s`** (margen de 4x sobre esos 90s,
+tolera perder hasta 3 reportes seguidos antes de forzar ralentí) --
+con el valor viejo, el motor podía seguir corriendo hasta 20x el
+intervalo real de reporte (30 min) con presión completamente obsoleta
+sin que el watchdog reaccionara. Sigue siendo un parámetro configurable
+por downlink (rango `60-3600s`) -- ajustar por nodo si el patrón real
+de pérdida de paquetes de su enlace LoRa lo justifica.
 
 - Transición Modo 0→1: pendiente de confirmar con cliente (¿por
   tiempo fijo, o estabilización de RPM?) -- hoy es siempre manual, por
@@ -993,39 +927,32 @@ PID ACTIVO  (CONTROL_HABILITADO=0 o =7, motor operando, Y SET_RPM >
 
 ---
 
-## 5. Sensor de presión (motobomba, 4-20mA) — **diseñado, no construido**
+## 5. Sensor de presión (motobomba, 4-20mA) — **implementado 2026-09-09, no probado en campo**
 
-Sensor: **PCM300-1M-G-B1-C15-J4** (0-1MPa, salida 4-20mA, alimentación
-12-30VDC).
+Sensor: **PCM300-1M-G-B1-C15-J4** (0-1MPa, salida 4-20mA). Circuito de
+acondicionamiento (LM358 actual + rediseño planeado con LM324/LM2902,
+alimentación, hallazgos de ruido de campo) → **ver hardware, sección 5**.
 
-Circuito de acondicionamiento (reemplaza intento inicial con
-RAK5801, descartado por requerir modificación de hardware no
-autorizada):
+`presion.c/h`: dispara una conversión de `ADC1_IN2` por polling en
+cada vuelta del loop principal (`Presion_Update()`), sin DMA/IT —
+de sobra para una señal tan lenta como un lazo 4-20mA. Convierte
+cuentas ADC → voltaje → corriente del lazo (usando la ganancia del
+op-amp y el `R_shunt` del circuito, ver hardware) → PSI, con un filtro EMA
+(`PRESION_ALPHA_FILTRO=0.2`, mismo criterio que `tacometro.c`) para
+suavizar el ruido del ADC. `Presion_SensorValido()` detecta lazo
+abierto (<3.5mA, cable cortado/sensor desconectado) o
+corto/sobre-rango (>20.5mA) — mientras esté en falla, la presión
+filtrada se congela en el último valor válido en vez de contaminarse
+con una lectura fuera de rango.
 
-```
-Lazo 4-20mA -> R_burden (49.9 ohm, mismo valor que usa el RAK5801 de
-              referencia) -> GND
-                    |
-              LM358 (config. no inversora, ganancia 3)
-              R1=10k ohm, R2=20k ohm (Ganancia = 1 + R2/R1 = 3)
-                    |
-              Filtro RC (1k ohm + 100nF) -> PA1 (ADC1_IN2 del G431)
-```
+**Calibración mA→PSI confirmada por el fabricante** (tabla de 17
+puntos, perfectamente lineal): `4mA = 0 PSI`, `20mA = 145.04 PSI`
+(equivale a 0-1MPa, consistente con el rango del sensor). Constantes
+en `presion.h` (`PRESION_PSI_EN_CORRIENTE_MIN/MAX`).
 
-Rango de salida esperado: 0.6V (4mA) a 3.0V (20mA) — dentro del rango
-0-3.3V del ADC, sin necesitar ADC externo (ADS1115 descartado, la
-resolución de 12 bits del ADC interno ya da ~0.336 kPa/paso, más que
-suficiente).
-
-Canal B del LM358 (no usado): ambas entradas a GND, para evitar
-oscilación/ruido acoplado desde el canal flotante.
-
-**Pendiente**: construir el circuito, escribir `presion.c/h`
-(lectura ADC + conversión a mA + conversión a presión real según el
-rango del sensor), y confirmar el voltaje de alimentación del lazo
-(12-24VDC, fuente separada del circuito de 3.3V). Hasta que esto
-exista, el uplink LIVE manda `presion = 0.0` como placeholder y el
-estado `ACTIVO` (que depende de esta lectura) no es alcanzable.
+Conectado a la telemetría: alimenta `Presion_GetPresionPsi()` en el
+uplink LIVE (antes placeholder `0.0f`) y determina el estado `ACTIVO`
+(ver sección 4.2).
 
 ---
 
@@ -1160,6 +1087,48 @@ escribir `SET_RATIO 17.5` y Enter.
 
 ## 8. Pendientes generales
 
+- [ ] **Calibración de campo del sensor de presión (planteado
+      2026-09-10, sin diseñar/implementar todavía).** Mismo patrón que
+      `SET_RATIO_AUTO` (sección 12): un parámetro nuevo configurable
+      donde el operador manda la lectura real de un manómetro de
+      referencia, y el firmware calcula y aplica un factor de
+      corrección (offset y/o ganancia) sobre `presion.c`, en vez de
+      confiar ciegamente en la calibración teórica de fábrica del
+      sensor + tolerancia de los componentes del circuito. Por ahora
+      (2026-09-10) el objetivo de la lectura de presión es solo
+      **tendencia general** (¿está presurizando o no?), no exactitud
+      fina — esta calibración es para cuando se necesite subir el
+      nivel de confianza de la lectura absoluta.
+- [ ] **Horómetro del motor — no diseñado, solo anotado como pendiente
+      (2026-09-10).**
+- [ ] **Supervisor de "no se llega a `PRESION_OBJETIVO`" en `MODO=2`
+      (planteado 2026-09-09, sin diseñar/implementar todavía).** Idea:
+      si el motor llega a `RPM_MAX` y la presión reportada sigue sin
+      alcanzar `PRESION_OBJETIVO`, desacelerar y volver a acelerar,
+      reintentar 3 veces, y si aun así no se logra, mandar una alarma.
+      Preguntas abiertas que hay que resolver antes de tocar código
+      (afecta control real de un motor operando, no se puede adivinar):
+      1. ¿Esto reemplaza la fórmula lineal actual de `MODO=2`
+         (`PRESION_OFFSET_RPM + PRESION_GANANCIA_RPM * PRESION`, ver
+         sección 4.3), o es un supervisor que se monta ENCIMA de ella
+         (la fórmula sigue mandando el setpoint normalmente; si se
+         satura en `RPM_MAX` sin que la presión suba, entra el ciclo de
+         desacelerar/reacelerar)?
+      2. "Desacelerar y volver a acelerar" — ¿a qué nivel desacelera
+         (`RPM_MIN`? ¿un valor intermedio configurable? ¿un % debajo de
+         `RPM_MAX`?), cuánto tiempo se queda ahí, y cuánto tiempo espera
+         en `RPM_MAX` antes de decidir "no llegó" (la presión no sube
+         instantáneo, hace falta un tiempo de asentamiento)?
+      3. "Llegar a la presión objetivo" — ¿`PRESION >= PRESION_OBJETIVO`
+         exacto, o con alguna tolerancia (ej. ±5%)?
+      4. Confirmar el conteo: ¿"3 veces" son 3 ciclos completos de
+         desacelerar+reacelerar en `RPM_MAX`?
+      5. La alarma — ¿un uplink forzado inmediato con el `estado` actual
+         (mismo mecanismo que `FORZAR_REPORTE`), o necesita un campo/bit
+         nuevo en el payload de 27 bytes (lo que implica también cambiar
+         `decoder.py` del lado AWS)? Y una vez disparada, ¿el motor
+         queda "trabado" ahí esperando un downlink de reset, o reintenta
+         solo cada cierto tiempo?
 - [x] Lazo PID (`pid.c/h`) implementado y activo en `main.c` (motor
       operando, sin calibración) — ver secciones 2.4 y 4.4.
 - [ ] Ganancias reales `PID_KP/KI/KD` — siguen en default (`1.0/0/0`),
@@ -1225,10 +1194,18 @@ escribir `SET_RATIO 17.5` y Enter.
       que exista `presion.c` (sección 5), decidir si `MODO=1` debería
       pasar a usar esa lectura propia en vez de `SET_RPM` (ver aviso en
       sección 4.3).
-- [ ] Construcción física y prueba del circuito de presión (LM358).
-- [ ] `presion.c/h` — módulo de lectura/conversión, sin escribir aún.
-      Una vez que exista, conectar el estado `ACTIVO` (sección 4.2) a
-      una lectura real en vez del placeholder `0.0`.
+- [x] Construcción física del circuito de presión (LM358) y `presion.c/h`
+      — implementado 2026-09-09, compilado limpio (0 errores/0
+      warnings), ver sección 5. **Pendiente real que queda**: prueba en
+      campo con el sensor real conectado al lazo 4-20mA (hoy solo
+      compile-verificado), y ajustar `PRESION_UMBRAL_ACTIVO_PSI`
+      (`main.c`, hoy `5.0` PSI sin dato de campo) una vez que se tenga
+      una sesión real con la motobomba cargada — ver sección 4.2.
+- [ ] El uplink LIVE ahora manda la presión real (PSI) en vez del
+      placeholder `0.0f` fijo — confirmar que `decoder.py` (AWS, fuera
+      de este repo) no tenga ninguna lógica que asumiera ese `0.0`
+      constante (ej. algún cálculo o validación que nunca se probó con
+      un valor distinto de cero).
 - [ ] `RESET_REMOTO` (ID 22) — recibido y validado, pero
       deliberadamente **no conectado** a ninguna acción real hasta
       definir qué hace el servo durante un reinicio (mantener última
